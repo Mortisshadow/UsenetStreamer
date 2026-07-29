@@ -250,7 +250,11 @@ async function triageAndRank(nzbResults, options = {}) {
   const downloadTimeoutMs = hasLargeCandidate
     ? Math.max(baseDownloadTimeoutMs, LARGE_NZB_DOWNLOAD_TIMEOUT_MS)
     : baseDownloadTimeoutMs;
-  const triageConfig = { ...triageOptions, reuseNntpPool: true };
+  // Honour the caller's reuse flag (NZB_TRIAGE_REUSE_POOL). Default is reuse
+  // (undefined/true → true); only an explicit false builds a fresh one-shot pool
+  // per run and closes it — which is what the flag is documented to do. Hardcoding
+  // true here made the setting a no-op for actual triage runs.
+  const triageConfig = { ...triageOptions, reuseNntpPool: triageOptions.reuseNntpPool !== false };
   const serializedChains = new Map();
 
   const runWithSerializedIndexer = async (indexerKey, task) => {
