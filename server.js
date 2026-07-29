@@ -69,6 +69,7 @@ const { sanitizeErrorForClient, TRIAGE_FINAL_STATUSES, isTriageFinalStatus, buil
 const { maskSensitiveValues, unsentinelValues, CREDENTIAL_MASK_SENTINEL, SENSITIVE_KEYS, SENSITIVE_KEY_PATTERNS, isSensitiveKey } = require('./src/utils/credentialMask');
 const { buildTriageNntpConfig, buildNntpServersArray } = require('./src/services/triage/nntpConfig');
 const { sanitizeStrictSearchPhrase, cleanSearchTitle, matchesStrictSearch, normaliseTitle, levenshteinRatio, titleSimilarityCheck, TITLE_SIMILARITY_THRESHOLD } = require('./src/utils/stringUtils');
+const { buildContentDisposition } = require('./src/utils/contentDisposition');
 const { formatResolutionBadge, extractQualityFeatureBadges, summarizeNewznabPlan } = require('./src/utils/formatters');
 const { normalizeUsenetGroup, extractUsenetGroup, extractFileCount, parseAllowedResolutionList, parseResolutionLimitValue, isResultFromPaidIndexer, dedupeResultsByTitle, DEDUPE_MODES } = require('./src/utils/resultUtils');
 
@@ -4960,7 +4961,7 @@ async function handleNzbdavStream(req, res) {
         res.setHeader('Content-Type', inferredMime);
         res.setHeader('Access-Control-Allow-Origin', '*');
         res.setHeader('Access-Control-Expose-Headers', 'Content-Length,Content-Range,Content-Type,Accept-Ranges');
-        res.setHeader('Content-Disposition', `inline; filename="${(cachedStream.fileName || 'stream').replace(/[\\/:*?"<>|]+/g, '_')}"`);
+        res.setHeader('Content-Disposition', buildContentDisposition(cachedStream.fileName || 'stream'));
         if (Number.isFinite(totalSize)) {
           res.setHeader('Content-Length', String(totalSize));
           res.setHeader('X-Total-Length', String(totalSize));
@@ -5071,7 +5072,7 @@ async function handleNzbdavStream(req, res) {
       res.setHeader('Content-Type', inferredMime);
       res.setHeader('Access-Control-Allow-Origin', '*');
       res.setHeader('Access-Control-Expose-Headers', 'Content-Length,Content-Range,Content-Type,Accept-Ranges');
-      res.setHeader('Content-Disposition', `inline; filename="${(streamData.fileName || 'stream').replace(/[\\/:*?"<>|]+/g, '_')}"`);
+      res.setHeader('Content-Disposition', buildContentDisposition(streamData.fileName || 'stream'));
       if (Number.isFinite(totalSize)) {
         res.setHeader('Content-Length', String(totalSize));
         res.setHeader('X-Total-Length', String(totalSize));
@@ -5240,7 +5241,7 @@ async function handleNzbFetch(req, res) {
     const safeName = rawName.replace(/[^\w.\-]+/g, '_').slice(0, 120) || 'stream';
     const fileName = /\.nzb$/i.test(safeName) ? safeName : `${safeName}.nzb`;
     res.setHeader('Content-Type', 'application/x-nzb+xml');
-    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+    res.setHeader('Content-Disposition', buildContentDisposition(fileName, 'attachment'));
     if (req.method === 'HEAD') { res.status(200).end(); return; }
     res.status(200).send(buffer);
   } catch (error) {

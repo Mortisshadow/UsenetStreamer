@@ -5,6 +5,7 @@ const path = require('path');
 const fs = require('fs');
 const http = require('http');
 const https = require('https');
+const { buildContentDisposition } = require('../utils/contentDisposition');
 const { promisify } = require('util');
 const { pipeline } = require('stream');
 const cache = require('../cache');
@@ -966,7 +967,7 @@ async function proxyNzbdavStream(req, res, viewPath, fileNameHint = '') {
     res.setHeader('Content-Type', inferredMime);
     res.setHeader('Content-Length', String(totalFileSize));
     res.setHeader('Accept-Ranges', 'bytes');
-    res.setHeader('Content-Disposition', `inline; filename="${sanitizedFileName}"`);
+    res.setHeader('Content-Disposition', buildContentDisposition(sanitizedFileName));
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Expose-Headers', 'Content-Length,Content-Range,Content-Type,Accept-Ranges');
     res.setHeader('X-Total-Length', String(totalFileSize));
@@ -1038,7 +1039,7 @@ async function proxyNzbdavStream(req, res, viewPath, fileNameHint = '') {
   const incomingDisposition = nzbdavResponse.headers?.['content-disposition'];
   const hasFilenameInDisposition = typeof incomingDisposition === 'string' && /filename=/i.test(incomingDisposition);
   if (!hasFilenameInDisposition) {
-    res.setHeader('Content-Disposition', `inline; filename="${sanitizedFileName}"`);
+    res.setHeader('Content-Disposition', buildContentDisposition(sanitizedFileName));
   }
 
   const inferredMime = inferMimeType(sanitizedFileName);

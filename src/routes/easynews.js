@@ -1,5 +1,6 @@
 const easynewsService = require('../services/easynews');
 const { sanitizeErrorForClient } = require('../utils/helpers');
+const { buildContentDisposition } = require('../utils/contentDisposition');
 
 module.exports = function createEasynewsHandler(getConfig) {
   return async function handleEasynewsNzbDownload(req, res) {
@@ -27,7 +28,7 @@ module.exports = function createEasynewsHandler(getConfig) {
         contentType: nzbData.contentType,
       });
       res.setHeader('Content-Type', nzbData.contentType || 'application/x-nzb+xml');
-      res.setHeader('Content-Disposition', `attachment; filename="${nzbData.fileName || 'easynews.nzb'}"`);
+      res.setHeader('Content-Disposition', buildContentDisposition(nzbData.fileName || 'easynews.nzb', 'attachment'));
       res.status(200).send(nzbData.buffer);
     } catch (error) {
       const statusCode = /credential|unauthorized|forbidden/i.test(error.message || '') ? 401 : 502;
