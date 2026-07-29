@@ -2568,6 +2568,7 @@ async function streamHandler(req, res) {
           requestLacksIdentifiers,
           strictMode: !isSpecialRequest && (type === 'movie' || type === 'series'),
           normalizeToAscii: tmdbService.normalizeToAscii,
+          originalLanguage: tmdbMetadata?.originalLanguage || null,
         });
         if (easynewsSearchParams) {
           console.log('[EASYNEWS] Prepared search queries', { count: easynewsSearchParams.queries.length, queries: easynewsSearchParams.queries });

@@ -40,6 +40,7 @@ function buildEasynewsSearchParams({
   requestLacksIdentifiers,
   strictMode,
   normalizeToAscii,
+  originalLanguage,
 }) {
   const seenKeys = new Set();
   const queries = [];
@@ -48,7 +49,7 @@ function buildEasynewsSearchParams({
   // originalTitle is the pre-normalization source used for the retained-ratio check.
   // When rawTitle is already asciiTitle (pre-normalized), pass the raw original separately
   // so we compare the ASCII result against the original character count, not itself.
-  const tryAdd = (rawTitle, alreadyHasSuffix = false, originalTitle = null) => {
+  const tryAdd = (rawTitle, alreadyHasSuffix = false, originalTitle = null, lang = null) => {
     if (!rawTitle) return;
     // Fold accents first (Café→Cafe, Über→Ueber) so the query matches the ASCII
     // form release names use, then ASCII-normalize for anything left.
@@ -59,10 +60,11 @@ function buildEasynewsSearchParams({
     // strip below can't trip the ratio.
     const original = (originalTitle || rawTitle).replace(/\s+/g, '');
     if (original.length > 0 && normalized.length / original.length < 0.8) return;
-    // Strip punctuation the indexer can't match: "&"→"and", apostrophes dropped
+    // Strip punctuation the indexer can't match: "&"→language word (und/en/et/…
+    // per the title's language, matching the newznab path), apostrophes dropped
     // ("Director's"→"Directors"), slashes/commas/parens/colons/dots → space
     // ("A/B"→"A B"). Without this a literal title returns 0 hits.
-    normalized = cleanSearchTitle(normalized);
+    normalized = cleanSearchTitle(normalized, lang);
     if (!normalized) return;
     const withSuffix = alreadyHasSuffix
       ? normalized.trim()
@@ -75,11 +77,13 @@ function buildEasynewsSearchParams({
   };
 
   if (isSpecialRequest) {
-    tryAdd(specialMetadataTitle, true);
-    tryAdd(movieTitle);
-    tryAdd(textQueryFallbackValue, true);
+    tryAdd(specialMetadataTitle, true, null, originalLanguage);
+    tryAdd(movieTitle, false, null, originalLanguage);
+    tryAdd(textQueryFallbackValue, true, null, originalLanguage);
   } else {
-    // TMDb title variants: English first, then all regional/additional
+    // TMDb title variants: English first, then all regional/additional. Each
+    // variant carries its own language so "&" transliterates correctly per
+    // variant (e.g. a Dutch title → "en", German → "und").
     if (tmdbTitles?.length > 0) {
       const sorted = [...tmdbTitles].sort((a, b) =>
         (a.language?.startsWith('en') ? 0 : 1) - (b.language?.startsWith('en') ? 0 : 1)
@@ -87,22 +91,22 @@ function buildEasynewsSearchParams({
       for (const t of sorted) {
         // Pass t.title as originalTitle so ratio is computed against the raw original,
         // not the pre-normalized asciiTitle
-        tryAdd(t.asciiTitle || t.title, false, t.title);
+        tryAdd(t.asciiTitle || t.title, false, t.title, t.language);
       }
     }
 
     // Anime: all searchable title variants
     if (isAnimeRequest && animeSearchableTitles?.length > 0) {
       for (const t of animeSearchableTitles) {
-        tryAdd(t.asciiTitle, false, t.title || t.asciiTitle);
+        tryAdd(t.asciiTitle, false, t.title || t.asciiTitle, t.language);
       }
     }
 
     // Text fallback (already has year/episode suffix)
-    tryAdd(textQueryFallbackValue, true);
+    tryAdd(textQueryFallbackValue, true, null, originalLanguage);
 
     // Title-only fallback when nothing else resolved
-    if (queries.length === 0) tryAdd(movieTitle);
+    if (queries.length === 0) tryAdd(movieTitle, false, null, originalLanguage);
   }
 
   // Last resort
