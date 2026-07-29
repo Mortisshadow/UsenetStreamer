@@ -5,8 +5,17 @@ const crypto = require('crypto');
 // Rate-limiter: true sliding-window per IP (admin routes only)
 // ---------------------------------------------------------------------------
 const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
-const RATE_LIMIT_MAX = 180;             // max requests per window
+const DEFAULT_RATE_LIMIT_MAX = 180;     // max admin requests per window
 const rateLimitBuckets = new Map();     // ip → number[] (timestamps)
+
+// Admin rate-limit cap, overridable via the RATE_LIMIT_MAX env var. Read at
+// call time so deployments behind a reverse proxy (where many admin sessions
+// share one source IP) can raise it without touching code. Invalid/unset →
+// default. (This is the admin-route limit only; stream routes are not limited.)
+function getRateLimitMax() {
+  const n = Number.parseInt(String(process.env.RATE_LIMIT_MAX || '').trim(), 10);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_RATE_LIMIT_MAX;
+}
 
 // ---------------------------------------------------------------------------
 // Failed-login lockout: block IP after repeated auth failures
@@ -45,7 +54,7 @@ function rateLimitCheck(req) {
   let start = 0;
   while (start < timestamps.length && timestamps[start] < cutoff) start++;
   if (start > 0) timestamps.splice(0, start);
-  if (timestamps.length >= RATE_LIMIT_MAX) return false;
+  if (timestamps.length >= getRateLimitMax()) return false;
   timestamps.push(now);
   return true;
 }
