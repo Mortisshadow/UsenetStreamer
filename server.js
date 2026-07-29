@@ -4656,6 +4656,18 @@ async function streamHandler(req, res) {
   app.get(route, streamHandler);
 });
 
+// True only when the request is the START of a stream — no Range header, or a
+// Range beginning at byte 0. Byte offsets are NOT portable across releases
+// (different encode/size/layout), so auto-advancing to a different file is only
+// safe at the start; substituting into a mid-file range (or a suffix range)
+// would answer offset N with another release's offset N and corrupt playback.
+function isStreamStartRequest(req) {
+  const range = req && req.headers && req.headers.range;
+  if (!range) return true;
+  const m = /^bytes=(\d+)-/i.exec(String(range).trim());
+  return Boolean(m) && Number(m[1]) === 0;
+}
+
 // --- Smart Play endpoint ---
 // When user clicks Smart Play, wait for the first healthy NZB from the background triage session,
 // then proxy the stream. If that stream fails, try the next auto-advance automatically.
@@ -4881,6 +4893,17 @@ async function handleSmartPlay(req, res) {
       await nzbdavService.proxyNzbdavStream(req, res, readySlot.viewPath, readySlot.fileName || '');
     } catch (proxyError) {
       if (proxyError?.isNzbdavFailure || proxyError?.code === 'ERR_STREAM_PREMATURE_CLOSE') {
+        // Only auto-advance to a different release at the START of a stream.
+        // Byte offsets aren't portable across releases, so substituting into a
+        // mid-file range would answer this offset with another release's bytes
+        // and corrupt playback. On a mid-file failure, error out so the player
+        // restarts from byte 0 (where a verified release can be swapped in).
+        if (!isStreamStartRequest(req)) {
+          console.warn(`[SMART-PLAY] Mid-file failure for ${readySlot.title}; not auto-advancing (byte offsets aren't portable) — erroring so the player restarts.`);
+          if (!res.headersSent) res.status(502).json({ error: sanitizeErrorForClient(proxyError) });
+          else res.end();
+          return;
+        }
         // Mark as failed and try the next auto-advance
         console.warn(`[SMART-PLAY] Stream failed for ${readySlot.title}: ${proxyError.message}, trying next auto-advance...`);
         bgSession.markFailed(readySlot.downloadUrl);
@@ -5097,7 +5120,12 @@ async function handleNzbdavStream(req, res) {
       const bgSession = effProtection.autoAdvanceEnabled && contentKey ? backgroundTriage.getSession(contentKey) : null;
       const fbSession = effProtection.autoAdvanceEnabled && contentKey && !bgSession ? autoAdvanceQueue.getSession(contentKey) : null;
       const activeSession = bgSession || fbSession;
-      if (activeSession && !res.headersSent) {
+      // Only substitute a different release at the START of a stream. Byte
+      // offsets aren't portable across releases (different encode/size/layout),
+      // so swapping the backing file into a mid-file range would answer this
+      // offset with another release's bytes and corrupt playback. A mid-file
+      // failure falls through to an error below so the player restarts from 0.
+      if (activeSession && isStreamStartRequest(req) && !res.headersSent) {
         console.log(`[AUTO-ADVANCE] Attempting auto-advance for ${contentKey}...`);
         // Mark the clicked URL as failed
         activeSession.markFailed(downloadUrl);
@@ -5164,11 +5192,18 @@ async function handleNzbdavStream(req, res) {
       }
 
       if (!res.headersSent) {
-        const served = await nzbdavService.streamFailureVideo(req, res, error);
-        if (!served && !res.headersSent) {
+        if (!isStreamStartRequest(req)) {
+          // Mid-file range failure: the failure video's bytes don't belong at
+          // this offset either (same portability problem as substituting a
+          // release). Return an error so the player restarts from byte 0.
           res.status(502).json({ error: sanitizeErrorForClient(error) });
-        } else if (!served) {
-          res.end();
+        } else {
+          const served = await nzbdavService.streamFailureVideo(req, res, error);
+          if (!served && !res.headersSent) {
+            res.status(502).json({ error: sanitizeErrorForClient(error) });
+          } else if (!served) {
+            res.end();
+          }
         }
       } else {
         // Headers already sent (mid-stream failure) — just close the connection
