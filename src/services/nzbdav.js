@@ -803,6 +803,16 @@ async function streamFileResponse(req, res, absolutePath, emulateHead, logPrefix
   return true;
 }
 
+// HTTP header values must be Latin1. Error messages can contain non-Latin1
+// characters (e.g. the em-dash in "…exhausted — no more options"), which makes
+// res.setHeader throw ERR_INVALID_CHAR — and since these headers sit on the
+// failure/recovery path, that would 500 the request instead of serving the
+// fallback video. The X-NZBDav-Failure header is diagnostic only, so strip it
+// to printable ASCII and cap the length; never let it break recovery.
+function sanitizeHeaderValue(value) {
+  return String(value == null ? '' : value).replace(/[^\x20-\x7E]/g, '-').slice(0, 256);
+}
+
 async function streamFailureVideo(req, res, failureError) {
   if (res.destroyed || res.writableEnded) {
     console.warn('[FAILURE STREAM] Response already closed, skipping failure video');
@@ -818,7 +828,7 @@ async function streamFailureVideo(req, res, failureError) {
   const failureMessage = failureError?.failureMessage || failureError?.message || 'NZBDav download failed';
 
   if (!res.headersSent) {
-    res.setHeader('X-NZBDav-Failure', failureMessage);
+    res.setHeader('X-NZBDav-Failure', sanitizeHeaderValue(failureMessage));
   }
 
   console.warn(`[FAILURE STREAM] Serving failure video due to NZBDav failure: ${failureMessage}`);
@@ -840,7 +850,7 @@ async function streamVideoTypeFailure(req, res, failureError) {
   const failureMessage = failureError?.failureMessage || failureError?.message || 'NZB did not contain a playable video file';
 
   if (!res.headersSent) {
-    res.setHeader('X-NZBDav-Failure', failureMessage);
+    res.setHeader('X-NZBDav-Failure', sanitizeHeaderValue(failureMessage));
   }
 
   console.warn(`[NO VIDEO STREAM] Serving failure video (no playable files): ${failureMessage}`);
