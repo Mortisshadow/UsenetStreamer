@@ -19,6 +19,10 @@ test('extracts common episode forms and multi-episode chains', () => {
   assert.deepEqual(extractSeasonEpisodePairs('Show 2x05 WEB-DL'), [
     { season: 2, episode: 5 },
   ]);
+  assert.deepEqual(extractSeasonEpisodePairs('[RH] Boku no Hero Academia - S2 - 07 [1080p]'), [
+    { season: 2, episode: 7 },
+  ]);
+  assert.deepEqual(extractSeasonEpisodePairs('Show S2-1080p BluRay'), []);
 });
 
 test('extracts batch episode ranges used by season and cour packs', () => {
@@ -61,6 +65,7 @@ test('spaced season and episode tokens are a single episode, not a pack', () => 
   assert.equal(getEpisodeMatchState(title, episode), 'exact');
   assert.equal(titleContainsSeasonPack(title, 2, 7), false);
   assert.equal(fileMatchesEpisode(`${title}.mkv`, episode), true);
+  assert.equal(titleContainsSeasonPack('[RH] Boku no Hero Academia - S2 - 07 [1080p]', 2, 7), false);
 });
 
 test('recognises requested season packs and rejects wrong-season packs', () => {

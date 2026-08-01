@@ -685,11 +685,13 @@ function sanitizeDecisionForCache(decision) {
   if (!decision) return null;
   return {
     status: decision.status || 'unknown',
+    releaseStatus: decision.releaseStatus || decision.status || 'unknown',
     blockers: Array.isArray(decision.blockers) ? decision.blockers : [],
     warnings: Array.isArray(decision.warnings) ? decision.warnings : [],
     fileCount: decision.fileCount ?? null,
     nzbIndex: decision.nzbIndex ?? null,
     archiveFindings: Array.isArray(decision.archiveFindings) ? decision.archiveFindings : [],
+    episodeCoverage: decision.episodeCoverage || null,
     title: decision.title || null,
     normalizedTitle: decision.normalizedTitle || null,
     indexerId: decision.indexerId || null,

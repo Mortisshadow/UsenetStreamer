@@ -4,6 +4,7 @@ const path = require('path');
 const crypto = require('crypto');
 const lzma = require('lzma-native');
 const { isVideoFileName } = require('../../utils/parsers');
+const { analyzeManifestEpisodeCoverage } = require('./episodeCoverage');
 const NNTPModule = require('nntp/lib/nntp');
 const NNTP = typeof NNTPModule === 'function' ? NNTPModule : NNTPModule?.NNTP;
 function timingLog(event, details) {
@@ -333,6 +334,14 @@ async function analyzeSingleNzb(raw, ctx) {
   const archiveFindings = [];
   const archiveFiles = files.filter(isArchiveFile);
   const archiveCandidates = dedupeArchiveCandidates(archiveFiles);
+  const episodeCoverage = analyzeManifestEpisodeCoverage(files, ctx.config);
+  const episodeCoverageMeta = episodeCoverage ? {
+    status: episodeCoverage.status,
+    source: episodeCoverage.source,
+    season: episodeCoverage.season,
+    episode: episodeCoverage.episode,
+    matchedFileCount: episodeCoverage.targetFiles.length,
+  } : null;
   const checkedSegments = new Set();
   let primaryArchive = null;
 
@@ -400,14 +409,24 @@ async function analyzeSingleNzb(raw, ctx) {
   if (archiveCandidates.length === 0) {
     warnings.add('no-archive-candidates');
 
-    const uniqueSegments = collectUniqueSegments(files);
+    // For a confirmed direct-video pack, sample the requested episode rather
+    // than an arbitrary file from the season. Ambiguous packs remain honest:
+    // their container can be healthy while episode coverage stays unknown.
+    const filesToSample = episodeCoverage?.status === 'confirmed'
+      && episodeCoverage.source === 'video-subject'
+      ? episodeCoverage.targetFiles
+      : files;
+    const uniqueSegments = collectUniqueSegments(filesToSample);
 
     if (!ctx.nntpPool) {
       if (ctx.nntpError) warnings.add(`nntp-error:${ctx.nntpError.code ?? ctx.nntpError.message}`);
       else warnings.add('nntp-disabled');
     } else if (uniqueSegments.length > 0) {
       const fallbackSampleCount = Math.max(1, Math.floor(ctx.config?.archiveSampleCount ?? 1));
-      const sampledSegments = pickRandomElements(uniqueSegments, fallbackSampleCount);
+      const sampledSegments = episodeCoverage?.status === 'confirmed'
+        && episodeCoverage.source === 'video-subject'
+        ? pickBoundaryElements(uniqueSegments, 3)
+        : pickRandomElements(uniqueSegments, fallbackSampleCount);
       await Promise.all(sampledSegments.map(async ({ segmentId, file }) => {
         try {
           await statSegment(ctx.nntpPool, segmentId);
@@ -448,6 +467,7 @@ async function analyzeSingleNzb(raw, ctx) {
       nzbTitle: extractTitle(parsed),
       nzbIndex: ctx.nzbIndex,
       archiveFindings,
+      episodeCoverage: episodeCoverageMeta,
     });
   }
 
@@ -473,7 +493,11 @@ async function analyzeSingleNzb(raw, ctx) {
     if (ctx.nntpError) warnings.add(`nntp-error:${ctx.nntpError.code ?? ctx.nntpError.message}`);
     else warnings.add('nntp-disabled');
   } else {
-    const archiveWithSegments = selectArchiveForInspection(archiveCandidates);
+    const targetArchives = episodeCoverage?.status === 'confirmed'
+      && episodeCoverage.source === 'archive-subject'
+      ? episodeCoverage.targetFiles
+      : archiveCandidates;
+    const archiveWithSegments = selectArchiveForInspection(targetArchives);
     if (archiveWithSegments) {
       const nzbPassword = extractPassword(parsed);
       const nntpResult = await inspectArchiveViaNntp(archiveWithSegments, ctx, files, nzbPassword);
@@ -508,11 +532,15 @@ async function analyzeSingleNzb(raw, ctx) {
   // Run STAT sampling for any archive inspection (including 7z) to detect missing articles
   const archiveInspected = Boolean(primaryArchive);
   if (ctx.nntpPool && archiveInspected && blockers.size === 0) {
-    const extraStatChecks = Math.max(0, Math.floor(ctx.config?.statSampleCount ?? 0));
+    const configuredStatChecks = Math.max(0, Math.floor(ctx.config?.statSampleCount ?? 0));
+    const extraStatChecks = episodeCoverage?.status === 'confirmed'
+      && episodeCoverage.source === 'archive-subject'
+      ? Math.max(2, configuredStatChecks)
+      : configuredStatChecks;
     if (extraStatChecks > 0 && primaryArchive?.segments?.length) {
       const availablePrimarySegments = primaryArchive.segments
         .filter((segment) => segment?.id && !checkedSegments.has(segment.id));
-      const primarySamples = pickRandomElements(
+      const primarySamples = pickBoundaryElements(
         availablePrimarySegments,
         Math.min(extraStatChecks, availablePrimarySegments.length),
       );
@@ -556,6 +584,7 @@ async function analyzeSingleNzb(raw, ctx) {
     nzbTitle: extractTitle(parsed),
     nzbIndex: ctx.nzbIndex,
     archiveFindings,
+    episodeCoverage: episodeCoverageMeta,
   });
 }
 
@@ -3325,6 +3354,22 @@ function pickRandomElements(items, maxCount) {
   return shuffled.slice(0, count);
 }
 
+function pickBoundaryElements(items, maxCount) {
+  if (!Array.isArray(items) || items.length === 0 || maxCount <= 0) return [];
+  const middle = Math.floor((items.length - 1) / 2);
+  const indexes = maxCount === 1
+    ? [middle]
+    : (maxCount === 2 ? [0, items.length - 1] : [0, middle, items.length - 1]);
+  const selected = [];
+  const seen = new Set();
+  for (const index of indexes) {
+    if (selected.length >= maxCount || seen.has(index)) continue;
+    seen.add(index);
+    selected.push(items[index]);
+  }
+  return selected;
+}
+
 function buildErrorDecision(err, nzbIndex) {
   const blockers = new Set(['analysis-error']);
   const warnings = new Set();
@@ -3391,4 +3436,3 @@ module.exports = {
   closeSharedNntpPool,
   evictStaleSharedNntpPool,
 };
-

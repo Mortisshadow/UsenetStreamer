@@ -158,13 +158,24 @@ function summarizeDecision(decision) {
     status = 'unverified_7z';
   }
 
+  const releaseStatus = status;
+  const episodeCoverage = decision?.episodeCoverage ?? null;
+  if (episodeCoverage?.status === 'missing') {
+    status = 'blocked';
+    if (!blockers.includes('requested-episode-missing')) blockers.push('requested-episode-missing');
+  } else if (episodeCoverage?.status === 'unknown' && status === 'verified') {
+    status = 'unverified';
+  }
+
   return {
     status,
+    releaseStatus,
     blockers,
     warnings,
     nzbIndex: decision?.nzbIndex ?? null,
     fileCount: decision?.fileCount ?? null,
     archiveFindings,
+    episodeCoverage,
   };
 }
 
@@ -203,6 +214,14 @@ async function triageAndRank(nzbResults, options = {}) {
   });
 
   const selectedCandidates = uniqueCandidates.slice(0, Math.min(maxCandidates, uniqueCandidates.length));
+  const maxSeasonPackCandidates = Math.max(0, Number(options.maxSeasonPackCandidates ?? 0));
+  if (maxSeasonPackCandidates > 0) {
+    const alreadySelectedUrls = new Set(selectedCandidates.map((candidate) => candidate.downloadUrl));
+    const extraPacks = uniqueCandidates
+      .filter((candidate) => candidate.result?.isSeasonPack === true && !alreadySelectedUrls.has(candidate.downloadUrl))
+      .slice(0, maxSeasonPackCandidates);
+    selectedCandidates.push(...extraPacks);
+  }
   if (selectedCandidates.length === 0) {
     return {
       decisions: new Map(),
@@ -450,7 +469,12 @@ async function triageAndRank(nzbResults, options = {}) {
           timeoutError.code = TIMEOUT_ERROR_CODE;
           throw timeoutError;
         }
-        return withTimeout(triageNzbs([nzbPayload], triageConfig), remaining);
+        const candidateTriageConfig = {
+          ...triageConfig,
+          requestedEpisode: options.requestedEpisode || null,
+          isSeasonPack: candidate.result?.isSeasonPack === true,
+        };
+        return withTimeout(triageNzbs([nzbPayload], candidateTriageConfig), remaining);
       };
 
       try {

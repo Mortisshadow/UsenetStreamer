@@ -2600,12 +2600,22 @@ async function streamHandler(req, res) {
         const episodeSuffix = /\s+s\d{1,3}e\d{1,4}\s*$/i;
         const episodePlans = searchPlans.filter((plan) => plan.type === 'search' && plan.rawQuery && episodeSuffix.test(plan.rawQuery));
         let packPlansAdded = 0;
+        const maxPackPlans = 6;
         for (const episodePlan of episodePlans) {
+          if (packPlansAdded >= maxPackPlans) break;
           const baseTitle = episodePlan.rawQuery.replace(episodeSuffix, '').trim();
           if (!baseTitle) continue;
-          const packQuery = `${baseTitle} S${String(seasonNum).padStart(2, '0')}`;
-          if (addPlan('search', { rawQuery: packQuery, seasonPack: true })) {
-            packPlansAdded += 1;
+          const paddedSeason = String(seasonNum).padStart(2, '0');
+          const packQueries = [
+            `${baseTitle} S${paddedSeason}`,
+            `${baseTitle} S${paddedSeason} Complete`,
+            `${baseTitle} Season ${seasonNum} Complete`,
+          ];
+          for (const packQuery of packQueries) {
+            if (packPlansAdded >= maxPackPlans) break;
+            if (addPlan('search', { rawQuery: packQuery, seasonPack: true })) {
+              packPlansAdded += 1;
+            }
           }
         }
         if (packPlansAdded > 0) {
@@ -3192,7 +3202,12 @@ async function streamHandler(req, res) {
         }
       }
 
-      console.log(`${INDEXER_LOG_PREFIX} Final NZB selection: ${finalNzbResults.length} results`, { elapsedMs: Date.now() - requestStartTs });
+      const selectedPacks = finalNzbResults.filter((result) => result.isSeasonPack === true);
+      console.log(`${INDEXER_LOG_PREFIX} Final NZB selection: ${finalNzbResults.length} results`, {
+        elapsedMs: Date.now() - requestStartTs,
+        seasonPacks: selectedPacks.length,
+        seasonPackSamples: selectedPacks.slice(0, 5).map((result) => result.title || result.Title || '(untitled)'),
+      });
     }
 
     // The sort/filter module globals the block reads directly are re-derived here
@@ -3595,6 +3610,9 @@ async function streamHandler(req, res) {
     const candidateHasConclusiveDecision = (candidate) => {
       const decision = triageDecisions.get(candidate.downloadUrl);
       if (decision && isTriageFinalStatus(decision.status)) {
+        if (candidate.isSeasonPack === true && requestedEpisode && !decision.episodeCoverage) {
+          return false;
+        }
         return true;
       }
       const normalizedTitle = normalizeReleaseTitle(candidate.title);
@@ -3637,6 +3655,8 @@ async function streamHandler(req, res) {
           serializedIndexerIds: serializedIndexerTokens,
           timeBudgetMs: TRIAGE_TIME_BUDGET_MS,
           maxCandidates: TRIAGE_MAX_CANDIDATES,
+          maxSeasonPackCandidates: 1,
+          requestedEpisode,
           downloadConcurrency: Math.max(1, Math.min(TRIAGE_DOWNLOAD_CONCURRENCY, TRIAGE_MAX_CANDIDATES)),
           triageOptions: {
             ...TRIAGE_BASE_OPTIONS,
@@ -3885,7 +3905,15 @@ async function streamHandler(req, res) {
       const triageInfo = directTriageInfo || (fallbackAllowed ? fallbackTriageInfo : null);
       const triageApplied = Boolean(directTriageInfo);
       const triageDerivedFromTitle = Boolean(!directTriageInfo && fallbackAllowed && fallbackTriageInfo);
-      const triageStatus = triageInfo?.status || (triageApplied ? 'unknown' : 'not-run');
+      const releaseTriageStatus = triageInfo?.releaseStatus || triageInfo?.status || (triageApplied ? 'unknown' : 'not-run');
+      // Episode coverage is specific to this exact NZB. General release health
+      // may be shared across equivalent titles, but pack inventory may not.
+      const episodeCoverage = result.isSeasonPack === true ? directTriageInfo?.episodeCoverage || null : null;
+      const triageStatus = episodeCoverage?.status === 'missing'
+        ? 'blocked'
+        : (episodeCoverage?.status === 'unknown' && releaseTriageStatus === 'verified'
+          ? 'unverified'
+          : releaseTriageStatus);
       if (INDEXER_HIDE_BLOCKED_RESULTS && triageStatus === 'blocked') {
         if (triageInfo) {
           // console.log('[STREMIO][TRIAGE] Hiding blocked stream', {
@@ -3910,12 +3938,18 @@ async function streamHandler(req, res) {
 
       if (triageStatus === 'verified') {
         triagePriority = 0;
-        triageTag = '✅';
+        triageTag = episodeCoverage?.status === 'confirmed'
+          ? `✅ E${String(episodeCoverage.episode).padStart(2, '0')}`
+          : '✅';
       } else if (triageStatus === 'unverified' || triageStatus === 'unverified_7z') {
-        triageTag = '⚠️';
+        triageTag = episodeCoverage?.status === 'unknown'
+          ? `⚠️ E${String(episodeCoverage.episode).padStart(2, '0')}?`
+          : '⚠️';
       } else if (triageStatus === 'blocked') {
         triagePriority = 2;
-        triageTag = '🚫';
+        triageTag = episodeCoverage?.status === 'missing'
+          ? `🚫 E${String(episodeCoverage.episode).padStart(2, '0')}`
+          : '🚫';
       } else if (triageStatus === 'fetch-error') {
         triagePriority = 2;
         triageTag = '⚠️';
@@ -4315,6 +4349,8 @@ async function streamHandler(req, res) {
               missingArticlesCheck: missingArticlesStatus,
               applied: triageApplied,
               inheritedFromTitle: triageDerivedFromTitle,
+              releaseStatus: releaseTriageStatus,
+              episodeCoverage,
             };
             stream.meta.healthCheck.archiveFindings = archiveFindings;
             // sourceDownloadUrl intentionally omitted — contains indexer API keys
@@ -4498,6 +4534,8 @@ async function streamHandler(req, res) {
             serializedIndexerIds: serializedIndexerTokens,
             timeBudgetMs: TRIAGE_TIME_BUDGET_MS,
             maxCandidates: TRIAGE_MAX_CANDIDATES,
+            maxSeasonPackCandidates: 1,
+            requestedEpisode,
             downloadConcurrency: Math.max(1, Math.min(TRIAGE_DOWNLOAD_CONCURRENCY, TRIAGE_MAX_CANDIDATES)),
             triageOptions: {
               ...TRIAGE_BASE_OPTIONS,
