@@ -330,7 +330,6 @@ async function triageAndRank(nzbResults, options = {}) {
   const publishVerifiedWinner = (candidate, decision) => {
     if (!returnOnFirstVerified || verifiedWinner || decision?.status !== 'verified') return;
     verifiedWinner = {
-      downloadUrl: candidate.downloadUrl,
       title: candidate.title,
       index: candidate.index,
     };
