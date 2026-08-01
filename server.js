@@ -2722,9 +2722,10 @@ async function streamHandler(req, res) {
           if (episodeMatchState === 'mismatch') return false;
           if (episodeMatchState === 'none' && seasonMatchState === 'mismatch') return false;
 
-          if (isRequestedSeasonPack) {
-            item.isSeasonPack = true;
-          }
+          // Classification belongs to this title/request pair. Always write
+          // the value so a stale flag from a cached/indexer object cannot turn
+          // an explicit S02E07 result into a season pack.
+          item.isSeasonPack = isRequestedSeasonPack;
 
           // Treasure Maps' TVDB endpoint can return broad show-level results.
           // Require either the exact episode or an explicitly recognised pack.

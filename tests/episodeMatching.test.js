@@ -52,6 +52,15 @@ test('matches requested files inside season packs', () => {
   assert.equal(fileMatchesEpisode('Mob.Psycho.100.S02E04E05.mkv', requested), true);
   assert.equal(fileMatchesEpisode('Mob.Psycho.100.S01E05.mkv', requested), false);
   assert.equal(fileMatchesEpisode('05.mkv', requested), false);
+  assert.equal(fileMatchesEpisode('Show.S02E01-E25.mkv', requested), false);
+});
+
+test('spaced season and episode tokens are a single episode, not a pack', () => {
+  const title = '[RH] Boku no Hero Academia - S2 - E7 [English Dubbed] [1080p]';
+  const episode = { season: 2, episode: 7 };
+  assert.equal(getEpisodeMatchState(title, episode), 'exact');
+  assert.equal(titleContainsSeasonPack(title, 2, 7), false);
+  assert.equal(fileMatchesEpisode(`${title}.mkv`, episode), true);
 });
 
 test('recognises requested season packs and rejects wrong-season packs', () => {

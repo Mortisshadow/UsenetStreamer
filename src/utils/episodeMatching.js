@@ -99,6 +99,21 @@ function getEpisodeMatchState(title, requestedEpisode, metadata = null) {
     : 'mismatch';
 }
 
+// Playback file selection must be stricter than release-title matching. A
+// release called S02E01-E25 can be a useful pack candidate, but a single video
+// file with that name is not necessarily seekable to E07. Only explicit
+// episode tokens make an inner video file an exact match.
+function getEpisodeFileMatchState(fileName, requestedEpisode) {
+  const requested = normalizeRequestedEpisode(requestedEpisode);
+  if (!requested) return 'none';
+
+  const pairs = extractSeasonEpisodePairs(fileName);
+  if (pairs.length === 0) return 'none';
+  return pairs.some((pair) => pair.season === requested.season && pair.episode === requested.episode)
+    ? 'exact'
+    : 'mismatch';
+}
+
 function extractSeasonTokens(title) {
   const raw = String(title || '');
   const seasons = new Set();
@@ -171,6 +186,7 @@ module.exports = {
   extractSeasonEpisodePairs,
   extractSeasonEpisodeRanges,
   getEpisodeMatchState,
+  getEpisodeFileMatchState,
   getSeasonMatchState,
   titleContainsSeasonPack,
 };
