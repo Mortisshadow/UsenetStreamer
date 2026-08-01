@@ -5,6 +5,10 @@ const { getDownloadUserAgentForIndexer, getProxyForIndexer } = require('../newzn
 const { getManagerProxy } = require('../indexer');
 const { proxiedGet } = require('../../utils/proxyAgent');
 const diskNzbCache = require('../../cache/diskNzbCache');
+const {
+  buildExactEvidenceKey,
+  runWithExactHealthEvidence,
+} = require('../../cache/healthEvidenceCache');
 const { sanitizeLogValue } = require('../../utils/logSanitizer');
 
 const DEFAULT_TIME_BUDGET_MS = 40000;
@@ -506,10 +510,29 @@ async function triageAndRank(nzbResults, options = {}) {
       };
 
       try {
-        const summary = await triageTask();
-        const firstDecision = summary?.decisions?.[0];
-        if (firstDecision) {
-          const summarized = summarizeDecision(firstDecision);
+        const evidenceKey = buildExactEvidenceKey({
+          nzbPayload,
+          triageConfig,
+          requestedEpisode: options.requestedEpisode || null,
+          isSeasonPack: candidate.result?.isSeasonPack === true,
+        });
+        const evidenceResult = await runWithExactHealthEvidence(evidenceKey, async () => {
+          const summary = await triageTask();
+          const firstDecision = summary?.decisions?.[0];
+          return firstDecision ? summarizeDecision(firstDecision) : null;
+        });
+        if (evidenceResult.value) {
+          const summarized = evidenceResult.value;
+          summarized.healthEvidenceSource = evidenceResult.source;
+          summarized.healthEvidenceAgeMs = evidenceResult.ageMs;
+          if (evidenceResult.source !== 'live') {
+            logEvent(logger, 'info', `Health evidence:${evidenceResult.source}-hit`, {
+              indexerId: candidate.indexerId,
+              indexerName: candidate.indexerName,
+              title: candidate.title,
+              ageMs: evidenceResult.ageMs,
+            });
+          }
           if (captureNzbPayloads && summarized.status === 'verified') {
             summarized.nzbPayload = nzbPayload;
           }

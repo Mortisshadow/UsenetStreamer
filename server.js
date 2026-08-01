@@ -2238,7 +2238,13 @@ async function streamHandler(req, res) {
     if (!usingCachedSearchResults) {
       const searchPlans = [];
       const seenPlans = new Set();
-      const addPlan = (planType, { tokens = [], rawQuery = null, skipHydra = false, seasonPack = false } = {}) => {
+      const addPlan = (planType, {
+        tokens = [],
+        rawQuery = null,
+        skipHydra = false,
+        seasonPack = false,
+        seasonPackFallback = false,
+      } = {}) => {
         // Word-boundary normalization for the text query (q=): slash/backslash in
         // a title (e.g. "A/B") aren't word boundaries to indexers, so the
         // literal query misses dotted release names. Treat them as spaces — the
@@ -2263,7 +2269,15 @@ async function streamHandler(req, res) {
           return false;
         }
         seenPlans.add(planKey);
-        const planRecord = { type: planType, query, rawQuery: rawQuery ? rawQuery : null, tokens: normalizedTokens, skipHydra: Boolean(skipHydra), seasonPack: Boolean(seasonPack) };
+        const planRecord = {
+          type: planType,
+          query,
+          rawQuery: rawQuery ? rawQuery : null,
+          tokens: normalizedTokens,
+          skipHydra: Boolean(skipHydra),
+          seasonPack: Boolean(seasonPack),
+          seasonPackFallback: Boolean(seasonPackFallback),
+        };
         if (strictTextMode && planType === 'search' && rawQuery && !isSpecialRequest) {
           const strictPhrase = sanitizeStrictSearchPhrase(rawQuery);
           if (strictPhrase) {
@@ -2637,13 +2651,23 @@ async function streamHandler(req, res) {
             }) : null;
           const aliasBase = resolvedPlanAlias || tmdbAlias;
           const packQueries = [
-            `${canonicalBase} S${paddedSeason} Complete`,
-            `${canonicalBase} Season ${seasonNum}`,
-            aliasBase ? `${aliasBase} Season ${seasonNum}` : `${canonicalBase} S${paddedSeason}`,
+            { query: `${canonicalBase} S${paddedSeason} Complete`, fallback: false },
+            { query: `${canonicalBase} Season ${seasonNum}`, fallback: false },
+            // A resolved alias is a precise alternative title and should run in
+            // the primary batch. The bare canonical `S02` form is deliberately
+            // a fallback: broad indexers can return hundreds of results for it.
+            {
+              query: aliasBase ? `${aliasBase} Season ${seasonNum}` : `${canonicalBase} S${paddedSeason}`,
+              fallback: !aliasBase,
+            },
           ];
-          for (const packQuery of packQueries) {
+          for (const packPlan of packQueries) {
             if (packPlansAdded >= maxPackPlans) break;
-            if (addPlan('search', { rawQuery: packQuery, seasonPack: true })) {
+            if (addPlan('search', {
+              rawQuery: packPlan.query,
+              seasonPack: true,
+              seasonPackFallback: packPlan.fallback,
+            })) {
               packPlansAdded += 1;
             }
           }
@@ -3051,14 +3075,20 @@ async function streamHandler(req, res) {
 
       // Now execute remaining text-based search plans (exclude already-processed ID plans)
       const remainingPlans = searchPlans.filter(p => !processedIdPlans.has(`${p.type}|${p.query}`));
-      console.log(`${INDEXER_LOG_PREFIX} Executing ${remainingPlans.length} text-based search plan(s)`);
+      const primaryTextPlans = remainingPlans.filter((plan) => !plan.seasonPackFallback);
+      const fallbackPackPlans = remainingPlans.filter((plan) => plan.seasonPackFallback);
+      console.log(`${INDEXER_LOG_PREFIX} Executing ${primaryTextPlans.length} primary text-based search plan(s)`, {
+        deferredPackFallbacks: fallbackPackPlans.length,
+      });
       const textSearchStartTs = Date.now();
-      const planExecutions = remainingPlans.map((plan) => {
-        console.log(`${INDEXER_LOG_PREFIX} Dispatching plan`, plan);
+      const executeTextPlanBatch = (plans, phase) => Promise.all(plans.map((plan) => {
+        console.log(`${INDEXER_LOG_PREFIX} Dispatching ${phase} plan`, plan);
+        const planStartTs = Date.now();
         return Promise.allSettled([
           executeManagerPlanWithBackoff(plan, effSkipManager),
           executeNewznabPlan(plan),
         ]).then((settled) => {
+          const durationMs = Date.now() - planStartTs;
           const managerSet = settled[0];
           const newznabSet = settled[1];
           const managerResults = managerSet?.status === 'fulfilled'
@@ -3092,6 +3122,7 @@ async function streamHandler(req, res) {
               errors,
               mgrCount: managerResults.length,
               newznabCount: filteredNewznab.length,
+              durationMs,
             };
           }
           return {
@@ -3102,12 +3133,37 @@ async function streamHandler(req, res) {
             mgrCount: managerResults.length,
             newznabCount: filteredNewznab.length,
             newznabEndpoints: Array.isArray(newznabSet?.value?.endpoints) ? newznabSet.value.endpoints : [],
+            durationMs,
           };
         });
-      });
+      }));
 
-      const planResultsSettled = await Promise.all(planExecutions);
-      console.log(`${INDEXER_LOG_PREFIX} Text-based searches completed in ${Date.now() - textSearchStartTs} ms`);
+      const primaryPlanResults = await executeTextPlanBatch(primaryTextPlans, 'primary');
+      const acceptedPrimaryPackCount = primaryPlanResults.reduce((count, result) => {
+        if (result.status !== 'fulfilled' || !result.plan?.seasonPack) return count;
+        const accepted = (Array.isArray(result.data) ? result.data : []).filter((item) => (
+          item
+          && typeof item === 'object'
+          && item.downloadUrl
+          && resultMatchesStrictPlan(result.plan, item)
+        )).length;
+        return count + accepted;
+      }, 0);
+
+      let fallbackPlanResults = [];
+      if (fallbackPackPlans.length > 0 && acceptedPrimaryPackCount === 0) {
+        console.log(`${INDEXER_LOG_PREFIX} No precise season pack found; executing ${fallbackPackPlans.length} broad fallback plan(s)`);
+        fallbackPlanResults = await executeTextPlanBatch(fallbackPackPlans, 'fallback');
+      } else if (fallbackPackPlans.length > 0) {
+        console.log(`${INDEXER_LOG_PREFIX} Skipping ${fallbackPackPlans.length} broad season-pack fallback plan(s)`, {
+          acceptedPrimaryPacks: acceptedPrimaryPackCount,
+        });
+      }
+      const planResultsSettled = [...primaryPlanResults, ...fallbackPlanResults];
+      console.log(`${INDEXER_LOG_PREFIX} Text-based searches completed in ${Date.now() - textSearchStartTs} ms`, {
+        primaryPlans: primaryPlanResults.length,
+        fallbackPlans: fallbackPlanResults.length,
+      });
 
       for (const result of planResultsSettled) {
         const { plan } = result;
@@ -3115,7 +3171,8 @@ async function streamHandler(req, res) {
           console.error(`${INDEXER_LOG_PREFIX} ❌ Search plan failed`, {
             message: result.error?.message || result.errors?.join('; ') || result.error,
             type: plan.type,
-            query: plan.query
+            query: plan.query,
+            durationMs: result.durationMs,
           });
           planSummaries.push({
             planType: plan.type,
@@ -3123,6 +3180,7 @@ async function streamHandler(req, res) {
             total: 0,
             filtered: 0,
             uniqueAdded: 0,
+            durationMs: result.durationMs,
             error: result.error?.message || result.errors?.join('; ') || 'Unknown failure'
           });
           continue;
@@ -3132,6 +3190,7 @@ async function streamHandler(req, res) {
         console.log(`${INDEXER_LOG_PREFIX} ✅ ${plan.type} returned ${planResults.length} total results for query "${plan.query}"`, {
           managerCount: result.mgrCount || 0,
           newznabCount: result.newznabCount || 0,
+          durationMs: result.durationMs,
           errors: result.errors && result.errors.length ? result.errors : undefined,
         });
 
@@ -3179,6 +3238,7 @@ async function streamHandler(req, res) {
           uniqueAdded: addedCount,
           managerCount: result.mgrCount || 0,
           newznabCount: result.newznabCount || 0,
+          durationMs: result.durationMs,
           errors: result.errors && result.errors.length ? result.errors : undefined,
         });
         console.log(`${INDEXER_LOG_PREFIX} ✅ Plan summary`, planSummaries[planSummaries.length - 1]);
@@ -3188,16 +3248,17 @@ async function streamHandler(req, res) {
       }
 
       const aggregationCount = usingStrictIdMatching ? aggregatedResults.length : resultsByKey.size;
+      const plansRun = planSummaries.length;
       if (aggregationCount === 0) {
-        console.warn(`${INDEXER_LOG_PREFIX} ⚠ All ${searchPlans.length} search plans returned no NZB results`);
+        console.warn(`${INDEXER_LOG_PREFIX} ⚠ All ${plansRun} executed search plans returned no NZB results`);
       } else if (usingStrictIdMatching) {
         console.log(`${INDEXER_LOG_PREFIX} ✅ Aggregated NZB results with strict ID matching`, {
-          plansRun: searchPlans.length,
+          plansRun,
           totalResults: aggregationCount
         });
       } else {
         console.log(`${INDEXER_LOG_PREFIX} ✅ Aggregated unique NZB results`, {
-          plansRun: searchPlans.length,
+          plansRun,
           uniqueResults: aggregationCount
         });
       }

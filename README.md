@@ -74,6 +74,7 @@
   1) the archive format is supported by NZBDav
   2) playable video files are present in the payload
 - Decisions are cached per download URL and per normalized title, so later requests inherit health verdicts instantly.
+- Exact positive health evidence is also reused for 30 minutes by NZB content, provider configuration, episode target, and health policy. This avoids repeated NNTP work for identical NZBs served through different URLs without treating errors or probabilistic guesses as verified.
 
 ### 🔐 Secure-by-Default
 - **Admin token** (`ADDON_SHARED_SECRET`) — used to access the admin dashboard where you can edit settings and credentials. Credentials are write-only (never exposed back to the UI).
