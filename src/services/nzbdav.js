@@ -41,6 +41,10 @@ let NZBDAV_HISTORY_FETCH_LIMIT = (() => {
   const raw = Number(process.env.NZBDAV_HISTORY_FETCH_LIMIT);
   return Number.isFinite(raw) && raw > 0 ? Math.min(raw, 500) : 400;
 })();
+let NZBDAV_HISTORY_SNAPSHOT_TTL_MS = (() => {
+  const raw = Number(process.env.NZBDAV_HISTORY_SNAPSHOT_TTL_MS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 2000;
+})();
 
 // WebDAV client cache (must be declared before reloadConfig)
 let webdavClientPromise = null;
@@ -52,6 +56,7 @@ const nzbdavHttpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50, maxF
 // File size cache: avoids repeated upstream HEAD/range probes for known files
 const FILE_SIZE_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 const fileSizeCache = new Map();
+const historySnapshotCache = new Map();
 
 function getCachedFileSize(urlKey) {
   const entry = fileSizeCache.get(urlKey);
@@ -94,6 +99,11 @@ function reloadConfig() {
     const raw = Number(process.env.NZBDAV_HISTORY_FETCH_LIMIT);
     return Number.isFinite(raw) && raw > 0 ? Math.min(raw, 500) : 400;
   })();
+  NZBDAV_HISTORY_SNAPSHOT_TTL_MS = (() => {
+    const raw = Number(process.env.NZBDAV_HISTORY_SNAPSHOT_TTL_MS);
+    return Number.isFinite(raw) && raw >= 0 ? raw : 2000;
+  })();
+  historySnapshotCache.clear();
   // Invalidate cached WebDAV client so next request uses fresh credentials
   resetWebdavClient();
 }
@@ -200,6 +210,8 @@ async function addNzbToNzbdav({ downloadUrl, cachedEntry = null, category, jobLa
       const response = await axios.post(`${NZBDAV_URL}/api`, form, {
         params,
         timeout: NZBDAV_API_TIMEOUT_MS,
+        httpAgent: nzbdavHttpAgent,
+        httpsAgent: nzbdavHttpsAgent,
         headers,
         maxBodyLength: Infinity,
         maxContentLength: Infinity,
@@ -287,6 +299,8 @@ async function addNzbToNzbdav({ downloadUrl, cachedEntry = null, category, jobLa
     const addResponse = await axios.post(`${NZBDAV_URL}/api`, form, {
       params: dlParams,
       timeout: NZBDAV_API_TIMEOUT_MS,
+      httpAgent: nzbdavHttpAgent,
+      httpsAgent: nzbdavHttpsAgent,
       headers: dlHeaders,
       maxBodyLength: Infinity,
       maxContentLength: Infinity,
@@ -334,6 +348,8 @@ async function addNzbToNzbdav({ downloadUrl, cachedEntry = null, category, jobLa
   const response = await axios.get(`${NZBDAV_URL}/api`, {
     params,
     timeout: NZBDAV_API_TIMEOUT_MS,
+    httpAgent: nzbdavHttpAgent,
+    httpsAgent: nzbdavHttpsAgent,
     headers,
     validateStatus: (status) => status < 500
   });
@@ -372,6 +388,8 @@ async function waitForNzbdavHistorySlot(nzoId, category) {
     const response = await axios.get(`${NZBDAV_URL}/api`, {
       params,
       timeout: NZBDAV_HISTORY_TIMEOUT_MS,
+      httpAgent: nzbdavHttpAgent,
+      httpsAgent: nzbdavHttpsAgent,
       headers,
       validateStatus: (status) => status < 500
     });
@@ -412,14 +430,42 @@ async function waitForNzbdavHistorySlot(nzoId, category) {
 }
 
 async function fetchCompletedNzbdavHistory(categories = [], limitOverride = null) {
-  return fetchNzbdavHistoryByStatus(categories, 'completed', limitOverride);
+  const snapshot = await fetchNzbdavHistorySnapshot(categories, limitOverride);
+  return snapshot.completed;
 }
 
 async function fetchFailedNzbdavHistory(categories = [], limitOverride = null) {
-  return fetchNzbdavHistoryByStatus(categories, 'failed', limitOverride);
+  const snapshot = await fetchNzbdavHistorySnapshot(categories, limitOverride);
+  return snapshot.failed;
 }
 
-async function fetchNzbdavHistoryByStatus(categories = [], statusFilter = 'completed', limitOverride = null) {
+function addHistorySlotToMap(results, slot, category) {
+  const jobName = slot?.job_name || slot?.JobName || slot?.name || slot?.Name || slot?.nzb_name || slot?.NzbName;
+  const nzoId = slot?.nzo_id || slot?.nzoId || slot?.NzoId;
+  if (!jobName || !nzoId) return;
+  const normalized = normalizeReleaseTitle(jobName);
+  if (!normalized || results.has(normalized)) return;
+  results.set(normalized, {
+    nzoId,
+    jobName,
+    category: slot?.category || slot?.Category || category || null,
+    size: slot?.size || slot?.Size || null,
+    failMessage: slot?.fail_message || slot?.failMessage || slot?.FailMessage || null,
+    slot,
+  });
+}
+
+function partitionHistorySlots(slots = [], category = null, target = null) {
+  const snapshot = target || { completed: new Map(), failed: new Map() };
+  for (const slot of slots) {
+    const status = (slot?.status || slot?.Status || '').toString().toLowerCase();
+    if (status === 'completed') addHistorySlotToMap(snapshot.completed, slot, category);
+    else if (status === 'failed') addHistorySlotToMap(snapshot.failed, slot, category);
+  }
+  return snapshot;
+}
+
+async function fetchNzbdavHistorySnapshotUncached(categories = [], limitOverride = null) {
   ensureNzbdavConfigured();
   const categoryList = Array.isArray(categories) && categories.length > 0
     ? Array.from(new Set(categories.filter((value) => value !== undefined && value !== null && String(value).trim() !== '')))
@@ -429,7 +475,8 @@ async function fetchNzbdavHistoryByStatus(categories = [], statusFilter = 'compl
     ? Math.floor(limitOverride)
     : NZBDAV_HISTORY_FETCH_LIMIT;
 
-  const results = new Map();
+  const completed = new Map();
+  const failed = new Map();
 
   for (const category of categoryList) {
     try {
@@ -447,6 +494,8 @@ async function fetchNzbdavHistoryByStatus(categories = [], statusFilter = 'compl
       const response = await axios.get(`${NZBDAV_URL}/api`, {
         params,
         timeout: NZBDAV_HISTORY_TIMEOUT_MS,
+        httpAgent: nzbdavHttpAgent,
+        httpsAgent: nzbdavHttpsAgent,
         headers,
         validateStatus: (status) => status < 500
       });
@@ -459,40 +508,43 @@ async function fetchNzbdavHistoryByStatus(categories = [], statusFilter = 'compl
       const history = response.data?.history || response.data?.History;
       const slots = history?.slots || history?.Slots || [];
 
-      for (const slot of slots) {
-        const status = (slot?.status || slot?.Status || '').toString().toLowerCase();
-        if (status !== statusFilter) {
-          continue;
-        }
-
-        const jobName = slot?.job_name || slot?.JobName || slot?.name || slot?.Name || slot?.nzb_name || slot?.NzbName;
-        const nzoId = slot?.nzo_id || slot?.nzoId || slot?.NzoId;
-        if (!jobName || !nzoId) {
-          continue;
-        }
-
-        const normalized = normalizeReleaseTitle(jobName);
-        if (!normalized) {
-          continue;
-        }
-
-        if (!results.has(normalized)) {
-          results.set(normalized, {
-            nzoId,
-            jobName,
-            category: slot?.category || slot?.Category || category || null,
-            size: slot?.size || slot?.Size || null,
-            failMessage: slot?.fail_message || slot?.failMessage || slot?.FailMessage || null,
-            slot
-          });
-        }
-      }
+      partitionHistorySlots(slots, category, { completed, failed });
     } catch (error) {
-      console.warn(`[NZBDAV] Failed to fetch ${statusFilter} history for category ${category || 'all'}: ${error.message}`);
+      console.warn(`[NZBDAV] Failed to fetch history for category ${category || 'all'}: ${error.message}`);
     }
   }
 
-  return results;
+  return { completed, failed };
+}
+
+async function fetchNzbdavHistorySnapshot(categories = [], limitOverride = null) {
+  const normalizedCategories = Array.isArray(categories)
+    ? Array.from(new Set(categories.filter(Boolean).map((value) => String(value).trim()))).sort()
+    : [];
+  const effectiveLimit = Number.isFinite(limitOverride) && limitOverride > 0
+    ? Math.floor(limitOverride)
+    : NZBDAV_HISTORY_FETCH_LIMIT;
+  const cacheKey = `${normalizedCategories.join('|') || '*'}|${effectiveLimit}`;
+  const now = Date.now();
+  const cached = historySnapshotCache.get(cacheKey);
+  if (cached?.value && now < cached.expiresAt) return cached.value;
+  if (cached?.promise) return cached.promise;
+
+  const promise = fetchNzbdavHistorySnapshotUncached(normalizedCategories, effectiveLimit)
+    .then((value) => {
+      historySnapshotCache.set(cacheKey, {
+        value,
+        expiresAt: Date.now() + NZBDAV_HISTORY_SNAPSHOT_TTL_MS,
+        promise: null,
+      });
+      return value;
+    })
+    .catch((error) => {
+      historySnapshotCache.delete(cacheKey);
+      throw error;
+    });
+  historySnapshotCache.set(cacheKey, { value: null, expiresAt: 0, promise });
+  return promise;
 }
 
 function buildNzbdavCacheKey(downloadUrl, category, requestedEpisode = null) {
@@ -869,7 +921,7 @@ async function streamVideoTypeFailure(req, res, failureError) {
   return streamFileResponse(req, res, VIDEO_TYPE_FAILURE_PATH, emulateHead, 'NO VIDEO STREAM', stats);
 }
 
-async function proxyNzbdavStream(req, res, viewPath, fileNameHint = '') {
+async function proxyNzbdavStream(req, res, viewPath, fileNameHint = '', fileSizeHint = null) {
   // Stremio sends many rapid range requests per stream — raise listener limit
   // to avoid false MaxListenersExceededWarning on res during concurrent proxying
   if (typeof res.setMaxListeners === 'function') {
@@ -933,7 +985,11 @@ async function proxyNzbdavStream(req, res, viewPath, fileNameHint = '') {
   if (req.headers['user-agent']) headers['User-Agent'] = req.headers['user-agent'];
   if (!headers['Accept-Encoding']) headers['Accept-Encoding'] = 'identity';
 
-  let totalFileSize = getCachedFileSize(targetUrl);
+  const normalizedSizeHint = Number(fileSizeHint);
+  let totalFileSize = Number.isFinite(normalizedSizeHint) && normalizedSizeHint > 0
+    ? normalizedSizeHint
+    : getCachedFileSize(targetUrl);
+  if (totalFileSize) setCachedFileSize(targetUrl, totalFileSize);
   if (NZBDAV_STREAM_PREFETCH_HEAD && !req.headers.range && !isHead && !totalFileSize) {
     const headConfig = {
       url: targetUrl,
@@ -1122,6 +1178,8 @@ module.exports = {
   waitForNzbdavHistorySlot,
   fetchCompletedNzbdavHistory,
   fetchFailedNzbdavHistory,
+  fetchNzbdavHistorySnapshot,
+  partitionHistorySlots,
   buildNzbdavCacheKey,
   listWebdavDirectory,
   findBestVideoFile,

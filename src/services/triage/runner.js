@@ -14,6 +14,45 @@ const DEFAULT_DOWNLOAD_TIMEOUT_MS = 15000;
 const LARGE_NZB_DOWNLOAD_TIMEOUT_MS = 15000;
 const LARGE_NZB_SIZE_THRESHOLD = 30 * 1024 * 1024 * 1024; // 30 GB
 const TIMEOUT_ERROR_CODE = 'TRIAGE_TIMEOUT';
+// Shared across requests so configured rate-sensitive indexers cannot be hit
+// concurrently by separate background/blocking triage sessions.
+const serializedIndexerChains = new Map();
+const nzbDownloadFlights = new Map();
+
+async function runNzbDownloadSingleFlight(downloadUrl, task) {
+  if (!downloadUrl) return task();
+  const existing = nzbDownloadFlights.get(downloadUrl);
+  if (existing) return existing;
+  const flight = Promise.resolve().then(task);
+  nzbDownloadFlights.set(downloadUrl, flight);
+  try {
+    return await flight;
+  } finally {
+    if (nzbDownloadFlights.get(downloadUrl) === flight) {
+      nzbDownloadFlights.delete(downloadUrl);
+    }
+  }
+}
+
+async function runWithIndexerSerialization(indexerKey, enabled, task) {
+  if (!enabled || !indexerKey) return task();
+  const previous = serializedIndexerChains.get(indexerKey) || Promise.resolve();
+  let releaseCurrent;
+  const currentGate = new Promise((resolve) => {
+    releaseCurrent = resolve;
+  });
+  const chained = previous.then(() => currentGate);
+  serializedIndexerChains.set(indexerKey, chained);
+  await previous;
+  try {
+    return await task();
+  } finally {
+    releaseCurrent();
+    if (serializedIndexerChains.get(indexerKey) === chained) {
+      serializedIndexerChains.delete(indexerKey);
+    }
+  }
+}
 
 function normalizeTitle(title) {
   if (title === undefined || title === null) return '';
@@ -267,30 +306,6 @@ async function triageAndRank(nzbResults, options = {}) {
   // per run and closes it — which is what the flag is documented to do. Hardcoding
   // true here made the setting a no-op for actual triage runs.
   const triageConfig = { ...triageOptions, reuseNntpPool: triageOptions.reuseNntpPool !== false };
-  const serializedChains = new Map();
-
-  const runWithSerializedIndexer = async (indexerKey, task) => {
-    if (!indexerKey || !serializedIndexerSet.has(indexerKey)) {
-      return task();
-    }
-    const previous = serializedChains.get(indexerKey) || Promise.resolve();
-    let releaseCurrent;
-    const currentGate = new Promise((resolve) => {
-      releaseCurrent = resolve;
-    });
-    const chained = previous.then(() => currentGate);
-    serializedChains.set(indexerKey, chained);
-    await previous;
-    try {
-      return await task();
-    } finally {
-      releaseCurrent();
-      if (serializedChains.get(indexerKey) === chained) {
-        serializedChains.delete(indexerKey);
-      }
-    }
-  };
-
   let cursor = 0;
   let timedOut = false;
   let evaluatedCount = 0;
@@ -317,8 +332,11 @@ async function triageAndRank(nzbResults, options = {}) {
 
       if (decisionMap.has(downloadUrl)) continue;
 
-      const indexerKey = normalizeIndexerToken(candidate.indexerId)
-        || normalizeIndexerToken(candidate.indexerName);
+      const indexerIdKey = normalizeIndexerToken(candidate.indexerId);
+      const indexerNameKey = normalizeIndexerToken(candidate.indexerName);
+      const indexerKey = indexerIdKey || indexerNameKey;
+      const serializedIndexerKey = [indexerIdKey, indexerNameKey]
+        .find((key) => key && serializedIndexerSet.has(key)) || null;
 
       if (Date.now() - startTs >= timeBudgetMs) {
         timedOut = true;
@@ -369,50 +387,63 @@ async function triageAndRank(nzbResults, options = {}) {
         });
       } else {
         try {
-          const abortController = new AbortController();
-          const hardTimeoutTimer = setTimeout(() => {
-            abortController.abort();
-          }, downloadTimeoutMs);
+          nzbPayload = await runNzbDownloadSingleFlight(
+            downloadUrl,
+            () => runWithIndexerSerialization(
+              serializedIndexerKey || indexerKey,
+              Boolean(serializedIndexerKey),
+              async () => {
+                if (Date.now() - startTs >= timeBudgetMs) {
+                  const error = new Error('Triage timed out while waiting for serialized indexer access');
+                  error.code = TIMEOUT_ERROR_CODE;
+                  throw error;
+                }
+                const abortController = new AbortController();
+                const hardTimeoutTimer = setTimeout(() => {
+                  abortController.abort();
+                }, downloadTimeoutMs);
 
-          const downloadUa = getDownloadUserAgentForIndexer(candidate.indexerId || candidate.indexerName)
-            || getDefaultDownloadUserAgent();
-          // Same proxy resolution as the NZBDav grab: matched Direct Newznab
-          // indexer uses its own proxy (null vs '' matters), non-match is
-          // manager-origin and uses the manager proxy.
-          const rowProxy = getProxyForIndexer(candidate.indexerId || candidate.indexerName);
-          const resolvedProxy = rowProxy === null ? getManagerProxy() : rowProxy;
-          const dlConfig = {
-            responseType: 'text',
-            timeout: downloadTimeoutMs,
-            signal: abortController.signal,
-            headers: {
-              Accept: 'application/x-nzb,text/xml;q=0.9,*/*;q=0.8',
-              'User-Agent': downloadUa,
-            },
-            transitional: { silentJSONParsing: true, forcedJSONParsing: false },
-            proxy: false,
-          };
-          // Proxy configured => follow redirects manually, re-evaluating the
-          // proxy per hop (a manager 301 to the real indexer must ride the
-          // proxy, not leak direct); fail-closed on a bad proxy. No proxy =>
-          // normal auto-follow.
-          const response = await (resolvedProxy
-            ? proxiedGet(downloadUrl, resolvedProxy, dlConfig)
-            : axios.get(downloadUrl, dlConfig)
-          ).finally(() => {
-            clearTimeout(hardTimeoutTimer);
-          });
-          if (typeof response.data !== 'string' || response.data.length === 0) {
-            throw new Error('Empty NZB payload');
-          }
-          nzbPayload = response.data;
+                const downloadUa = getDownloadUserAgentForIndexer(candidate.indexerId || candidate.indexerName)
+                  || getDefaultDownloadUserAgent();
+                // Same proxy resolution as the NZBDav grab: matched Direct Newznab
+                // indexer uses its own proxy (null vs '' matters), non-match is
+                // manager-origin and uses the manager proxy.
+                const rowProxy = getProxyForIndexer(candidate.indexerId || candidate.indexerName);
+                const resolvedProxy = rowProxy === null ? getManagerProxy() : rowProxy;
+                const dlConfig = {
+                  responseType: 'text',
+                  timeout: downloadTimeoutMs,
+                  signal: abortController.signal,
+                  headers: {
+                    Accept: 'application/x-nzb,text/xml;q=0.9,*/*;q=0.8',
+                    'User-Agent': downloadUa,
+                  },
+                  transitional: { silentJSONParsing: true, forcedJSONParsing: false },
+                  proxy: false,
+                };
+                // Proxy configured => follow redirects manually, re-evaluating the
+                // proxy per hop (a manager 301 to the real indexer must ride the
+                // proxy, not leak direct); fail-closed on a bad proxy. No proxy =>
+                // normal auto-follow.
+                const response = await (resolvedProxy
+                  ? proxiedGet(downloadUrl, resolvedProxy, dlConfig)
+                  : axios.get(downloadUrl, dlConfig)
+                ).finally(() => {
+                  clearTimeout(hardTimeoutTimer);
+                });
+                if (typeof response.data !== 'string' || response.data.length === 0) {
+                  throw new Error('Empty NZB payload');
+                }
+                return response.data;
+              },
+            ),
+          );
           const elapsed = Date.now() - downloadStart;
-
-          // Cache the downloaded payload for potential retries
+          // Cache the downloaded payload for potential retries. Coalesced
+          // callers populate their own per-session cache from the shared value.
           if (nzbPayloadCache) {
             nzbPayloadCache.set(downloadUrl, nzbPayload);
           }
-
           logEvent(logger, 'info', 'NZB download:success', {
             downloadUrl,
             indexerId: candidate.indexerId,
@@ -549,4 +580,6 @@ async function triageAndRank(nzbResults, options = {}) {
 
 module.exports = {
   triageAndRank,
+  runWithIndexerSerialization,
+  runNzbDownloadSingleFlight,
 };

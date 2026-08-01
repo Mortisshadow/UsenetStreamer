@@ -3500,21 +3500,6 @@ async function streamHandler(req, res) {
       }
     }
 
-    if (triagePrewarmPromise) {
-      const prewarmStart = Date.now();
-      console.log('[NZB TRIAGE] Waiting for NNTP pool pre-warm to complete (timeout: 10s)...');
-      const PREWARM_TIMEOUT_MS = 10000;
-      const prewarmSettled = await Promise.race([
-        triagePrewarmPromise.then(() => 'resolved'),
-        new Promise((resolve) => setTimeout(() => resolve('timeout'), PREWARM_TIMEOUT_MS)),
-      ]).catch((err) => {
-        console.warn('[NZB TRIAGE] Pre-warm await failed', err?.message || err);
-        return 'error';
-      });
-      console.log(`[NZB TRIAGE] Pre-warm await finished: ${prewarmSettled} (${Date.now() - prewarmStart} ms)`);
-      triagePrewarmPromise = null;
-    }
-
     const logTopLanguages = () => {
       // const sample = finalNzbResults.slice(0, 10).map((result, idx) => ({
       //   rank: idx + 1,
@@ -3573,12 +3558,9 @@ async function streamHandler(req, res) {
     let failedByTitle = new Map();
     if (effStreamingMode !== 'native') {
       try {
-        const [completedResult, failedResult] = await Promise.all([
-          nzbdavService.fetchCompletedNzbdavHistory([categoryForType]),
-          nzbdavService.fetchFailedNzbdavHistory([categoryForType]),
-        ]);
-        historyByTitle = completedResult;
-        failedByTitle = failedResult;
+        const historySnapshot = await nzbdavService.fetchNzbdavHistorySnapshot([categoryForType]);
+        historyByTitle = historySnapshot.completed;
+        failedByTitle = historySnapshot.failed;
         if (historyByTitle.size > 0) {
           console.log(`[NZBDAV] Loaded ${historyByTitle.size} completed NZBs for instant playback detection (category=${categoryForType})`);
         }
@@ -3707,6 +3689,23 @@ async function streamHandler(req, res) {
       if (!TRIAGE_NNTP_CONFIG) {
         console.warn('[NZB TRIAGE] Skipping health checks because NNTP configuration is missing');
       } else {
+        // Only blocking triage needs the pool before the manifest can be
+        // returned. Background mode must never hold the Stremio response on a
+        // cold NNTP connect/auth; its prewarm continues fire-and-forget.
+        if (triagePrewarmPromise) {
+          const prewarmStart = Date.now();
+          console.log('[NZB TRIAGE] Waiting for NNTP pool pre-warm before blocking checks (timeout: 10s)...');
+          const PREWARM_TIMEOUT_MS = 10000;
+          const prewarmSettled = await Promise.race([
+            triagePrewarmPromise.then(() => 'resolved'),
+            new Promise((resolve) => setTimeout(() => resolve('timeout'), PREWARM_TIMEOUT_MS)),
+          ]).catch((err) => {
+            console.warn('[NZB TRIAGE] Pre-warm await failed', err?.message || err);
+            return 'error';
+          });
+          console.log(`[NZB TRIAGE] Blocking pre-warm await finished: ${prewarmSettled} (${Date.now() - prewarmStart} ms)`);
+          triagePrewarmPromise = null;
+        }
         const triageLogger = (level, message, context) => {
           const logFn = level === 'error' ? console.error : level === 'warn' ? console.warn : console.log;
           if (context) logFn(`[NZB TRIAGE] ${message}`, context);
@@ -5001,7 +5000,7 @@ async function handleSmartPlay(req, res) {
         return;
       }
       try {
-        await nzbdavService.proxyNzbdavStream(req, res, peekedSlot.viewPath, peekedSlot.fileName || '');
+        await nzbdavService.proxyNzbdavStream(req, res, peekedSlot.viewPath, peekedSlot.fileName || '', peekedSlot.size);
         return;
       } catch (proxyErr) {
         // Client disconnected — no point retrying on a dead response
@@ -5039,7 +5038,7 @@ async function handleSmartPlay(req, res) {
               bgSession.autoAdvanceSession.activate();
             }
           }
-          await nzbdavService.proxyNzbdavStream(req, res, slot.viewPath, slot.fileName || '');
+          await nzbdavService.proxyNzbdavStream(req, res, slot.viewPath, slot.fileName || '', slot.size);
           return true;
         }
         console.warn(`[SMART-PLAY] ${label} mounted candidate returned no viewPath, falling back to verified`);
@@ -5171,7 +5170,7 @@ async function handleSmartPlay(req, res) {
     }
 
     try {
-      await nzbdavService.proxyNzbdavStream(req, res, readySlot.viewPath, readySlot.fileName || '');
+      await nzbdavService.proxyNzbdavStream(req, res, readySlot.viewPath, readySlot.fileName || '', readySlot.size);
     } catch (proxyError) {
       if (proxyError?.isNzbdavFailure || proxyError?.code === 'ERR_STREAM_PREMATURE_CLOSE') {
         // Only auto-advance to a different release at the START of a stream.
@@ -5193,7 +5192,7 @@ async function handleSmartPlay(req, res) {
           const nextSlot = await bgSession.waitForReady(60000);
           console.log(`[SMART-PLAY] Auto-advance slot: ${redactSensitiveString(nextSlot.title || nextSlot.downloadUrl)}`);
           if (!res.headersSent) {
-            await nzbdavService.proxyNzbdavStream(req, res, nextSlot.viewPath, nextSlot.fileName || '');
+            await nzbdavService.proxyNzbdavStream(req, res, nextSlot.viewPath, nextSlot.fileName || '', nextSlot.size);
           }
         } catch (autoAdvanceError) {
           if (!res.headersSent) {
@@ -5273,7 +5272,7 @@ async function handleNzbdavStream(req, res) {
         res.status(200).end();
         return;
       }
-      await nzbdavService.proxyNzbdavStream(req, res, cachedStream.viewPath, cachedStream.fileName || '');
+      await nzbdavService.proxyNzbdavStream(req, res, cachedStream.viewPath, cachedStream.fileName || '', cachedStream.size);
       return;
     }
 
@@ -5385,7 +5384,7 @@ async function handleNzbdavStream(req, res) {
       return;
     }
 
-    await nzbdavService.proxyNzbdavStream(req, res, streamData.viewPath, streamData.fileName || '');
+    await nzbdavService.proxyNzbdavStream(req, res, streamData.viewPath, streamData.fileName || '', streamData.size);
   } catch (error) {
     if (error?.isNzbdavFailure) {
       console.warn('[NZBDAV] Stream failure detected:', error.failureMessage || error.message);
@@ -5455,7 +5454,7 @@ async function handleNzbdavStream(req, res) {
           });
 
           if (!res.headersSent && !res.destroyed) {
-            await nzbdavService.proxyNzbdavStream(req, res, resolvedSlot.viewPath, resolvedSlot.fileName || '');
+            await nzbdavService.proxyNzbdavStream(req, res, resolvedSlot.viewPath, resolvedSlot.fileName || '', resolvedSlot.size);
           }
           return;
         } catch (autoAdvanceErr) {

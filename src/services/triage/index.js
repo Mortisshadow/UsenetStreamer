@@ -978,35 +978,19 @@ async function inspectArchiveViaNntp(file, ctx, allFiles, nzbPassword) {
   const effectiveFilename = file.filename || guessFilenameFromSubject(file.subject) || '';
   const isSevenZip = isSevenZipFilename(effectiveFilename);
   return runWithClient(ctx.nntpPool, async (client) => {
-    // For 7z archives, do a quick STAT pre-check before the heavier deep inspection.
-    // For RAR/ZIP, skip upfront STAT — the BODY fetch on the same segment will
-    // inherently verify existence, avoiding a redundant round-trip.
+    // Deep 7z inspection necessarily fetches the first BODY. A separate STAT
+    // of that same Message-ID adds a full NNTP roundtrip without stronger
+    // evidence, so BODY is the existence + signature probe.
     if (isSevenZip) {
-      let statStart = null;
-      if (currentMetrics) {
-        currentMetrics.statCalls += 1;
-        statStart = Date.now();
-      }
-      try {
-        await statSegmentWithClient(client, segmentId);
-        if (currentMetrics && statStart !== null) {
-          currentMetrics.statSuccesses += 1;
-          currentMetrics.statDurationMs += Date.now() - statStart;
-        }
-      } catch (err) {
-        if (currentMetrics && statStart !== null) {
-          currentMetrics.statDurationMs += Date.now() - statStart;
-          if (err.code === 'STAT_MISSING' || err.code === 430) currentMetrics.statMissing += 1;
-          else currentMetrics.statErrors += 1;
-        }
-        if (err.code === 'STAT_MISSING' || err.code === 430) return { status: 'stat-missing', details: { segmentId }, segmentId };
-        return { status: 'stat-error', details: { segmentId, message: err.message }, segmentId };
-      }
-
       try {
         const deepResult = await inspectSevenZipDeep(file, ctx, allFiles || [], client, nzbPassword);
         return { ...deepResult, segmentId };
       } catch (err) {
+        if (err.code === 'BODY_MISSING') return { status: 'body-missing', details: { segmentId }, segmentId };
+        if (err.code === 'DECODE_ERROR') return { status: 'decode-error', details: { segmentId, message: err.message }, segmentId };
+        if (err.code === 'BODY_ERROR' || err.dropClient || ['ETIMEDOUT', 'ECONNRESET', 'ECONNABORTED', 'EPIPE'].includes(err.code)) {
+          return { status: 'body-error', details: { segmentId, message: err.message }, segmentId };
+        }
         // Deep inspection failed; fall back to signature-ok so 7z still caps at unverified_7z
         return { status: 'sevenzip-signature-ok', details: { filename: effectiveFilename, deepError: err?.message }, segmentId };
       }
@@ -1662,6 +1646,30 @@ async function inspectSevenZipDeep(file, ctx, allFiles, client, nzbPassword) {
   const parts = findSevenZipParts(allFiles, file);
   const firstPart = parts[0];
   const lastPart = parts[parts.length - 1];
+  // Header and footer can live in the same Usenet article for small archives.
+  // Cache decoded bodies within this inspection so that article is never
+  // downloaded twice.
+  const decodedBodyCache = new Map();
+  const fetchDecodedBody = async (segmentId) => {
+    if (decodedBodyCache.has(segmentId)) return decodedBodyCache.get(segmentId);
+    const startedAt = Date.now();
+    if (currentMetrics) currentMetrics.bodyCalls += 1;
+    try {
+      const body = await fetchSegmentBodyWithClient(client, segmentId);
+      const decoded = decodeYencBuffer(body, 2 * 1024 * 1024);
+      decodedBodyCache.set(segmentId, decoded);
+      if (currentMetrics) currentMetrics.bodySuccesses += 1;
+      return decoded;
+    } catch (error) {
+      if (currentMetrics) {
+        if (error.code === 'BODY_MISSING') currentMetrics.bodyMissing += 1;
+        else currentMetrics.bodyErrors += 1;
+      }
+      throw error;
+    } finally {
+      if (currentMetrics) currentMetrics.bodyDurationMs += Date.now() - startedAt;
+    }
+  };
 
   // --- Fetch first segment of first part (contains 7z start header) ---
   const firstSegments = firstPart.segments ?? [];
@@ -1673,8 +1681,7 @@ async function inspectSevenZipDeep(file, ctx, allFiles, client, nzbPassword) {
     return { status: 'sevenzip-signature-ok', details: { reason: 'no-first-segment-id' } };
   }
 
-  const headerBody = await fetchSegmentBodyWithClient(client, firstSegId);
-  const headerBuf = decodeYencBuffer(headerBody, 2 * 1024 * 1024);
+  const headerBuf = await fetchDecodedBody(firstSegId);
 
   // Verify signature
   if (headerBuf.length < 32 || !headerBuf.subarray(0, 6).equals(SEVENZIP_SIGNATURE)) {
@@ -1699,8 +1706,7 @@ async function inspectSevenZipDeep(file, ctx, allFiles, client, nzbPassword) {
     return { status: 'sevenzip-signature-ok', details: { reason: 'no-last-segment-id' } };
   }
 
-  const footerBody = await fetchSegmentBodyWithClient(client, lastSegId);
-  const footerBuf = decodeYencBuffer(footerBody, 2 * 1024 * 1024);
+  const footerBuf = await fetchDecodedBody(lastSegId);
 
   // The metadata header lives at the very end of the archive.
   // footerBuf is the decoded last segment, so the metadata should be

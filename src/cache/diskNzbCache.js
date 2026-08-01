@@ -18,6 +18,12 @@ let indexPath = path.join(cacheDir, INDEX_FILE);
 // `bytes` = actual on-disk .nzb size (for the budget); `sizeBytes` = media size metadata.
 let index = new Map();
 let initialized = false;
+const pendingPayloads = new Map();
+let indexSaveTimer = null;
+let maintenanceTimer = null;
+let indexWriteChain = Promise.resolve();
+let cacheGeneration = 0;
+let pendingWriteSequence = 0;
 
 // 30-day TTL backstop (the size budget below is the primary control).
 const CACHE_TTL_MS = (() => {
@@ -96,6 +102,46 @@ function saveIndex() {
   }
 }
 
+function saveIndexAsync() {
+  ensureDir();
+  const snapshot = JSON.stringify(Array.from(index.values()));
+  const tempPath = `${indexPath}.${process.pid}.tmp`;
+  const writeGeneration = cacheGeneration;
+  indexWriteChain = indexWriteChain
+    .catch(() => undefined)
+    .then(async () => {
+      if (writeGeneration !== cacheGeneration) return;
+      await fs.promises.writeFile(tempPath, snapshot, 'utf8');
+      if (writeGeneration !== cacheGeneration) {
+        try { await fs.promises.unlink(tempPath); } catch { /* ignore */ }
+        return;
+      }
+      await fs.promises.rename(tempPath, indexPath);
+    })
+    .catch((err) => {
+      console.warn('[DISK-CACHE] Failed to save index asynchronously:', err.message);
+    });
+  return indexWriteChain;
+}
+
+function scheduleIndexSave(delayMs = 250) {
+  if (indexSaveTimer) clearTimeout(indexSaveTimer);
+  indexSaveTimer = setTimeout(() => {
+    indexSaveTimer = null;
+    saveIndexAsync();
+  }, delayMs);
+  if (typeof indexSaveTimer.unref === 'function') indexSaveTimer.unref();
+}
+
+function scheduleMaintenance() {
+  if (maintenanceTimer) return;
+  maintenanceTimer = setTimeout(() => {
+    maintenanceTimer = null;
+    cleanup({ deferredSave: true });
+  }, 1000);
+  if (typeof maintenanceTimer.unref === 'function') maintenanceTimer.unref();
+}
+
 // Reconcile the index against what is actually on disk:
 //  - drop index entries whose .nzb file is gone, and backfill missing byte sizes;
 //  - delete orphaned .nzb files that nothing in the index references (the only
@@ -156,7 +202,7 @@ function evictLeastRecentlyUsed(shouldContinue) {
   return changed;
 }
 
-function cleanup() {
+function cleanup({ deferredSave = false } = {}) {
   const now = Date.now();
   let changed = false;
 
@@ -187,7 +233,10 @@ function cleanup() {
     changed = evictLeastRecentlyUsed(() => index.size > MAX_ENTRIES) || changed;
   }
 
-  if (changed) saveIndex();
+  if (changed) {
+    if (deferredSave) scheduleIndexSave();
+    else saveIndex();
+  }
 }
 
 function tryDeleteFile(hash) {
@@ -205,31 +254,63 @@ function cacheToDisk(downloadUrl, nzbPayload, metadata = {}) {
   const hash = urlHash(downloadUrl);
   const now = Date.now();
   const expiresAt = CACHE_TTL_MS > 0 ? now + CACHE_TTL_MS : null;
-  try {
-    ensureDir();
-    fs.writeFileSync(payloadPath(hash), nzbPayload, 'utf8');
-    index.set(downloadUrl, {
-      url: downloadUrl,
-      hash,
-      title: metadata.title || null,
-      sizeBytes: metadata.size || null,
-      fileName: metadata.fileName || null,
-      bytes: Buffer.byteLength(nzbPayload, 'utf8'),
-      createdAt: now,
-      lastAccessedAt: now,
-      expiresAt,
-    });
-    saveIndex();
-    // Enforce TTL + size budget continuously (not just at startup).
-    cleanup();
-  } catch (err) {
-    console.warn('[DISK-CACHE] Failed to write NZB payload:', err.message);
-  }
+  const payloadBuffer = Buffer.from(nzbPayload, 'utf8');
+  const entry = {
+    url: downloadUrl,
+    hash,
+    title: metadata.title || null,
+    sizeBytes: metadata.size || null,
+    fileName: metadata.fileName || null,
+    bytes: payloadBuffer.length,
+    createdAt: now,
+    lastAccessedAt: now,
+    expiresAt,
+  };
+  // Make the payload immediately reusable by NZBDav/auto-advance while the
+  // actual disk write proceeds outside the request's critical path.
+  pendingPayloads.set(downloadUrl, { payloadBuffer, entry });
+
+  const targetPath = payloadPath(hash);
+  pendingWriteSequence += 1;
+  const tempPath = `${targetPath}.${process.pid}.${now}.${pendingWriteSequence}.tmp`;
+  const writeGeneration = cacheGeneration;
+  const writePromise = (async () => {
+    try {
+      await fs.promises.mkdir(cacheDir, { recursive: true });
+      await fs.promises.writeFile(tempPath, payloadBuffer);
+      await fs.promises.rename(tempPath, targetPath);
+      if (writeGeneration !== cacheGeneration) return;
+      index.set(downloadUrl, entry);
+      scheduleIndexSave();
+      scheduleMaintenance();
+    } catch (err) {
+      try { await fs.promises.unlink(tempPath); } catch { /* ignore */ }
+      console.warn('[DISK-CACHE] Failed to write NZB payload:', err.message);
+    } finally {
+      const pending = pendingPayloads.get(downloadUrl);
+      if (pending?.entry === entry) pendingPayloads.delete(downloadUrl);
+    }
+  })();
+  return writePromise;
 }
 
 function getFromDisk(downloadUrl) {
   if (!downloadUrl) return null;
   init();
+  const pending = pendingPayloads.get(downloadUrl);
+  if (pending) {
+    return {
+      downloadUrl,
+      payloadBuffer: pending.payloadBuffer,
+      size: pending.payloadBuffer.length,
+      metadata: {
+        title: pending.entry.title || null,
+        sizeBytes: pending.entry.sizeBytes || null,
+        fileName: pending.entry.fileName || null,
+      },
+      createdAt: pending.entry.createdAt,
+    };
+  }
   const entry = index.get(downloadUrl);
   if (!entry) return null;
   if (entry.expiresAt && entry.expiresAt <= Date.now()) {
@@ -268,6 +349,7 @@ function getFromDisk(downloadUrl) {
 function hasCachedPayload(downloadUrl) {
   if (!downloadUrl) return false;
   init();
+  if (pendingPayloads.has(downloadUrl)) return true;
   const entry = index.get(downloadUrl);
   if (!entry) return false;
   if (entry.expiresAt && entry.expiresAt <= Date.now()) return false;
@@ -277,6 +359,12 @@ function hasCachedPayload(downloadUrl) {
 function clearDiskCache(reason = 'manual') {
   init();
   const count = index.size;
+  cacheGeneration += 1;
+  if (indexSaveTimer) clearTimeout(indexSaveTimer);
+  if (maintenanceTimer) clearTimeout(maintenanceTimer);
+  indexSaveTimer = null;
+  maintenanceTimer = null;
+  pendingPayloads.clear();
   for (const entry of index.values()) {
     tryDeleteFile(entry.hash);
   }
@@ -293,7 +381,7 @@ function clearDiskCache(reason = 'manual') {
 // between writes (and persists any lazily-updated LRU recency).
 function runMaintenance() {
   init();
-  cleanup();
+  cleanup({ deferredSave: true });
 }
 
 function getDiskCacheStats() {
@@ -311,6 +399,12 @@ function getDiskCacheStats() {
 function reloadConfig() {
   const newDir = (process.env.NZB_CACHE_DIR || '').trim() || DEFAULT_CACHE_DIR;
   if (newDir !== cacheDir) {
+    cacheGeneration += 1;
+    if (indexSaveTimer) clearTimeout(indexSaveTimer);
+    if (maintenanceTimer) clearTimeout(maintenanceTimer);
+    indexSaveTimer = null;
+    maintenanceTimer = null;
+    pendingPayloads.clear();
     cacheDir = newDir;
     indexPath = path.join(cacheDir, INDEX_FILE);
     initialized = false;
