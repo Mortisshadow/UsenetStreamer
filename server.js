@@ -3607,6 +3607,24 @@ async function streamHandler(req, res) {
         getIndexerKey,
       });
     }
+    // The normal top-N health candidates are usually single episodes. Keep one
+    // pack candidate beyond that cap so manifest coverage is actually checked
+    // instead of merely implemented downstream but never reached.
+    if (requestedEpisode) {
+      const selectedUrls = new Set(triageEligibleResults.map((candidate) => candidate.downloadUrl));
+      const packCandidate = triagePool.find((candidate) => {
+        if (candidate?.isSeasonPack !== true || selectedUrls.has(candidate.downloadUrl)) return false;
+        const existingDecision = triageDecisions.get(candidate.downloadUrl);
+        return !existingDecision?.episodeCoverage;
+      });
+      if (packCandidate) {
+        triageEligibleResults.push(packCandidate);
+        console.log('[NZB TRIAGE] Reserved episode-aware health slot for pack', {
+          title: packCandidate.title,
+          requestedEpisode,
+        });
+      }
+    }
     const candidateHasConclusiveDecision = (candidate) => {
       const decision = triageDecisions.get(candidate.downloadUrl);
       if (decision && isTriageFinalStatus(decision.status)) {

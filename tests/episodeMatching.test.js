@@ -22,6 +22,9 @@ test('extracts common episode forms and multi-episode chains', () => {
   assert.deepEqual(extractSeasonEpisodePairs('[RH] Boku no Hero Academia - S2 - 07 [1080p]'), [
     { season: 2, episode: 7 },
   ]);
+  assert.deepEqual(extractSeasonEpisodePairs('Mob.Psycho.100.S2.-.05.720p'), [
+    { season: 2, episode: 5 },
+  ]);
   assert.deepEqual(extractSeasonEpisodePairs('Show S2-1080p BluRay'), []);
 });
 

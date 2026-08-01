@@ -38,7 +38,7 @@ function extractSeasonEpisodePairs(title) {
 
   // Anime releases also commonly omit the E token: "S2 - 07". Require a
   // visible separator and reject resolution-like suffixes such as S2-1080p.
-  for (const match of raw.matchAll(/(?:^|[^a-z0-9])s(\d{1,3})\s*[-–—._]\s*(\d{1,3})(?!\d|p\b)/gi)) {
+  for (const match of raw.matchAll(/(?:^|[^a-z0-9])s(\d{1,3})[\s._–—-]+(\d{1,3})(?!\d|p\b)/gi)) {
     add(match[1], match[2]);
   }
 
