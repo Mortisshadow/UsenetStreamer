@@ -245,7 +245,12 @@ async function triageAndRank(nzbResults, options = {}) {
   const constrainedCandidates = allowedIndexerSet.size > 0
     ? builtCandidates.filter((candidate) => candidateMatchesIndexerSet(candidate, allowedIndexerSet))
     : builtCandidates;
-  const candidates = rankCandidates(constrainedCandidates, preferredSizeBytes, preferredIndexerSet);
+  // The caller already supplies its authoritative SEL/sort order. Racing mode
+  // must preserve that order so rank 1 starts first instead of being silently
+  // re-sorted by file size inside the health runner.
+  const candidates = options.preserveInputOrder
+    ? constrainedCandidates.slice()
+    : rankCandidates(constrainedCandidates, preferredSizeBytes, preferredIndexerSet);
   const uniqueCandidates = [];
   const seenTitles = new Set();
   candidates.forEach((candidate) => {
@@ -314,6 +319,23 @@ async function triageAndRank(nzbResults, options = {}) {
   let timedOut = false;
   let evaluatedCount = 0;
   let fetchFailures = 0;
+  const returnOnFirstVerified = Boolean(options.returnOnFirstVerified);
+  const hedgeDelayMs = Math.max(0, Number(options.hedgeDelayMs) || 0);
+  let verifiedWinner = null;
+  let resolveVerifiedWinner;
+  const verifiedWinnerPromise = new Promise((resolve) => {
+    resolveVerifiedWinner = resolve;
+  });
+
+  const publishVerifiedWinner = (candidate, decision) => {
+    if (!returnOnFirstVerified || verifiedWinner || decision?.status !== 'verified') return;
+    verifiedWinner = {
+      downloadUrl: candidate.downloadUrl,
+      title: candidate.title,
+      index: candidate.index,
+    };
+    resolveVerifiedWinner(verifiedWinner);
+  };
 
   const makeTimeoutDecision = (url) => attachMetadata(url, {
     status: 'error',
@@ -333,6 +355,16 @@ async function triageAndRank(nzbResults, options = {}) {
 
       const candidate = selectedCandidates[index];
       const { downloadUrl } = candidate;
+
+      if (returnOnFirstVerified && verifiedWinner) return;
+      const hedgeRemainingMs = (startTs + (index * hedgeDelayMs)) - Date.now();
+      if (hedgeRemainingMs > 0) {
+        await new Promise((resolve) => {
+          const timer = setTimeout(resolve, hedgeRemainingMs);
+          if (typeof timer.unref === 'function') timer.unref();
+        });
+      }
+      if (returnOnFirstVerified && verifiedWinner) return;
 
       if (decisionMap.has(downloadUrl)) continue;
 
@@ -540,6 +572,7 @@ async function triageAndRank(nzbResults, options = {}) {
           decisionMap.set(downloadUrl, finalDecision);
           evaluatedCount += 1;
           if (onDecisionCb) try { onDecisionCb(downloadUrl, finalDecision); } catch { /* ignore */ }
+          publishVerifiedWinner(candidate, finalDecision);
         } else {
           const noResultDecision = attachMetadata(downloadUrl, {
             status: 'error',
@@ -575,12 +608,27 @@ async function triageAndRank(nzbResults, options = {}) {
     }
   });
 
-  await Promise.all(workers);
+  const workersDone = Promise.all(workers).then(
+    () => ({ reason: 'complete' }),
+    (error) => {
+      logEvent(logger, 'warn', 'Racing ladder worker failed', { message: error?.message || error });
+      return { reason: 'worker-error' };
+    },
+  );
+  let ladderExit = { reason: 'complete' };
+  if (returnOnFirstVerified) {
+    ladderExit = await Promise.race([
+      workersDone,
+      verifiedWinnerPromise.then((winner) => ({ reason: 'verified-winner', winner })),
+    ]);
+  } else {
+    ladderExit = await workersDone;
+  }
 
   selectedCandidates.forEach((candidate) => {
     if (!decisionMap.has(candidate.downloadUrl)) {
       decisionMap.set(candidate.downloadUrl, attachMetadata(candidate.downloadUrl, {
-        status: timedOut ? 'pending' : 'skipped',
+        status: timedOut || ladderExit.reason === 'verified-winner' ? 'pending' : 'skipped',
         blockers: [],
         warnings: [],
         archiveFindings: [],
@@ -590,14 +638,25 @@ async function triageAndRank(nzbResults, options = {}) {
     }
   });
 
+  // In-flight hedged checks may finish after a verified winner releases the
+  // blocking request. Return an immutable snapshot; late work only warms the
+  // exact-evidence/payload caches and cannot mutate the response in flight.
+  const returnedDecisionMap = new Map(decisionMap);
+
   return {
-    decisions: decisionMap,
+    decisions: returnedDecisionMap,
     elapsedMs: Date.now() - startTs,
     timedOut,
     candidatesConsidered: selectedCandidates.length,
     evaluatedCount,
     fetchFailures,
     summary: null,
+    racingLadder: {
+      enabled: returnOnFirstVerified,
+      hedgeDelayMs,
+      reason: ladderExit.reason,
+      winner: ladderExit.winner || verifiedWinner,
+    },
   };
 }
 

@@ -72,6 +72,7 @@ const { maskSensitiveValues, unsentinelValues, CREDENTIAL_MASK_SENTINEL, SENSITI
 const { buildTriageNntpConfig, buildNntpServersArray } = require('./src/services/triage/nntpConfig');
 const { sanitizeStrictSearchPhrase, cleanSearchTitle, matchesStrictSearch, matchesStrictPackTitle, normaliseTitle, levenshteinRatio, titleSimilarityCheck, TITLE_SIMILARITY_THRESHOLD } = require('./src/utils/stringUtils');
 const { getEpisodeMatchState, getSeasonMatchState, classifyPackTitle } = require('./src/utils/episodeMatching');
+const { computeAdaptiveTriageBudget } = require('./src/utils/requestBudget');
 const { buildContentDisposition } = require('./src/utils/contentDisposition');
 const { formatResolutionBadge, extractQualityFeatureBadges, summarizeNewznabPlan } = require('./src/utils/formatters');
 const { normalizeUsenetGroup, extractUsenetGroup, extractFileCount, parseAllowedResolutionList, parseResolutionLimitValue, isResultFromPaidIndexer, dedupeResultsByTitle, DEDUPE_MODES } = require('./src/utils/resultUtils');
@@ -892,6 +893,10 @@ function deriveStreamProtection() {
   if (d.forcePrefetchOff) TRIAGE_PREFETCH_FIRST_VERIFIED = false; // no protection = no prefetch
 }
 let TRIAGE_TIME_BUDGET_MS = toPositiveInt(process.env.NZB_TRIAGE_TIME_BUDGET_MS, 25000);
+let STREAM_RESPONSE_BUDGET_MS = toPositiveInt(process.env.NZB_STREAM_RESPONSE_BUDGET_MS, 24000);
+let STREAM_RESPONSE_RESERVE_MS = toPositiveInt(process.env.NZB_STREAM_RESPONSE_RESERVE_MS, 1000);
+let TRIAGE_RACING_LADDER = toBoolean(process.env.NZB_TRIAGE_RACING_LADDER, true);
+let TRIAGE_RACING_HEDGE_MS = toPositiveInt(process.env.NZB_TRIAGE_RACING_HEDGE_MS, 650);
 let TRIAGE_MAX_CANDIDATES = toPositiveInt(process.env.NZB_TRIAGE_MAX_CANDIDATES, 25);
 let TRIAGE_DOWNLOAD_CONCURRENCY = toPositiveInt(process.env.NZB_TRIAGE_DOWNLOAD_CONCURRENCY, 4);
 let TRIAGE_PRIORITY_INDEXERS = parseCommaList(process.env.NZB_TRIAGE_PRIORITY_INDEXERS);
@@ -1204,6 +1209,10 @@ function rebuildRuntimeConfig({ log = true } = {}) {
   SMART_PLAY_MODE = (process.env.NZB_SMART_PLAY_MODE || 'fastest').trim().toLowerCase() === 'top-ranked' ? 'top-ranked' : 'fastest';
   deriveStreamProtection();
   TRIAGE_TIME_BUDGET_MS = toPositiveInt(process.env.NZB_TRIAGE_TIME_BUDGET_MS, 25000);
+  STREAM_RESPONSE_BUDGET_MS = toPositiveInt(process.env.NZB_STREAM_RESPONSE_BUDGET_MS, 24000);
+  STREAM_RESPONSE_RESERVE_MS = toPositiveInt(process.env.NZB_STREAM_RESPONSE_RESERVE_MS, 1000);
+  TRIAGE_RACING_LADDER = toBoolean(process.env.NZB_TRIAGE_RACING_LADDER, true);
+  TRIAGE_RACING_HEDGE_MS = toPositiveInt(process.env.NZB_TRIAGE_RACING_HEDGE_MS, 650);
   TRIAGE_MAX_CANDIDATES = toPositiveInt(process.env.NZB_TRIAGE_MAX_CANDIDATES, 25);
   TRIAGE_DOWNLOAD_CONCURRENCY = toPositiveInt(process.env.NZB_TRIAGE_DOWNLOAD_CONCURRENCY, 4);
   TRIAGE_PRIORITY_INDEXERS = parseCommaList(process.env.NZB_TRIAGE_PRIORITY_INDEXERS);
@@ -1319,6 +1328,10 @@ const ADMIN_CONFIG_KEYS = [
   'NZB_TRIAGE_MODE',
   'NZB_TRIAGE_HEALTH_METHOD',
   'NZB_TRIAGE_TIME_BUDGET_MS',
+  'NZB_STREAM_RESPONSE_BUDGET_MS',
+  'NZB_STREAM_RESPONSE_RESERVE_MS',
+  'NZB_TRIAGE_RACING_LADDER',
+  'NZB_TRIAGE_RACING_HEDGE_MS',
   'NZB_TRIAGE_MAX_CANDIDATES',
   'NZB_TRIAGE_PRIORITY_INDEXERS',
   'NZB_TRIAGE_PRIORITY_INDEXER_LIMITS',
@@ -4083,18 +4096,33 @@ async function streamHandler(req, res) {
         // cold NNTP connect/auth; its prewarm continues fire-and-forget.
         if (triagePrewarmPromise) {
           const prewarmStart = Date.now();
-          console.log('[NZB TRIAGE] Waiting for NNTP pool pre-warm before blocking checks (timeout: 10s)...');
-          const PREWARM_TIMEOUT_MS = 10000;
-          const prewarmSettled = await Promise.race([
-            triagePrewarmPromise.then(() => 'resolved'),
-            new Promise((resolve) => setTimeout(() => resolve('timeout'), PREWARM_TIMEOUT_MS)),
-          ]).catch((err) => {
-            console.warn('[NZB TRIAGE] Pre-warm await failed', err?.message || err);
-            return 'error';
+          const prewarmBudget = computeAdaptiveTriageBudget({
+            requestStartTs,
+            configuredTriageBudgetMs: TRIAGE_TIME_BUDGET_MS,
+            responseBudgetMs: STREAM_RESPONSE_BUDGET_MS,
+            responseReserveMs: STREAM_RESPONSE_RESERVE_MS,
           });
-          console.log(`[NZB TRIAGE] Blocking pre-warm await finished: ${prewarmSettled} (${Date.now() - prewarmStart} ms)`);
-          triagePrewarmPromise = null;
+          const prewarmTimeoutMs = Math.min(10000, prewarmBudget.triageBudgetMs);
+          if (prewarmTimeoutMs > 0) {
+            console.log('[NZB TRIAGE] Waiting for NNTP pool pre-warm before blocking checks', { timeoutMs: prewarmTimeoutMs });
+            const prewarmSettled = await Promise.race([
+              triagePrewarmPromise.then(() => 'resolved'),
+              new Promise((resolve) => setTimeout(() => resolve('timeout'), prewarmTimeoutMs)),
+            ]).catch((err) => {
+              console.warn('[NZB TRIAGE] Pre-warm await failed', err?.message || err);
+              return 'error';
+            });
+            console.log(`[NZB TRIAGE] Blocking pre-warm await finished: ${prewarmSettled} (${Date.now() - prewarmStart} ms)`);
+            triagePrewarmPromise = null;
+          }
         }
+        const adaptiveBudget = computeAdaptiveTriageBudget({
+          requestStartTs,
+          configuredTriageBudgetMs: TRIAGE_TIME_BUDGET_MS,
+          responseBudgetMs: STREAM_RESPONSE_BUDGET_MS,
+          responseReserveMs: STREAM_RESPONSE_RESERVE_MS,
+        });
+        console.log('[NZB TRIAGE] Adaptive blocking budget', adaptiveBudget);
         const triageLogger = (level, message, context) => {
           const logFn = level === 'error' ? console.error : level === 'warn' ? console.warn : console.log;
           if (context) logFn(`[NZB TRIAGE] ${message}`, context);
@@ -4104,19 +4132,34 @@ async function streamHandler(req, res) {
           allowedIndexerIds: combinedHealthTokens,
           preferredIndexerIds: combinedHealthTokens, // Use same indexers for filtering and ranking
           serializedIndexerIds: serializedIndexerTokens,
-          timeBudgetMs: TRIAGE_TIME_BUDGET_MS,
+          timeBudgetMs: adaptiveBudget.triageBudgetMs,
           maxCandidates: TRIAGE_MAX_CANDIDATES,
           requestedEpisode,
           downloadConcurrency: Math.max(1, Math.min(TRIAGE_DOWNLOAD_CONCURRENCY, TRIAGE_MAX_CANDIDATES)),
           triageOptions: {
             ...TRIAGE_BASE_OPTIONS,
             nntpConfig: { ...TRIAGE_NNTP_CONFIG },
+            healthCheckTimeoutMs: adaptiveBudget.triageBudgetMs,
           },
+          returnOnFirstVerified: TRIAGE_RACING_LADDER,
+          preserveInputOrder: TRIAGE_RACING_LADDER,
+          hedgeDelayMs: TRIAGE_RACING_LADDER ? TRIAGE_RACING_HEDGE_MS : 0,
           captureNzbPayloads: true,
           logger: triageLogger,
           nzbPayloadCache: getOrPruneUpfrontPayloadCache(),
         };
-        try {
+        if (adaptiveBudget.triageBudgetMs <= 0) {
+          triageOutcome = {
+            decisions: new Map(),
+            elapsedMs: 0,
+            timedOut: true,
+            candidatesConsidered: triageCandidatesToRun.length,
+            evaluatedCount: 0,
+            fetchFailures: 0,
+            racingLadder: { enabled: TRIAGE_RACING_LADDER, reason: 'response-deadline' },
+          };
+          console.warn('[NZB TRIAGE] Skipping blocking checks because the response deadline is exhausted');
+        } else try {
           triageOutcome = await triageAndRank(triageCandidatesToRun, triageOptions);
           logMemoryUsage('blocking-triage-complete', { candidates: triageCandidatesToRun.length });
           const latestDecisions = triageOutcome?.decisions instanceof Map ? triageOutcome.decisions : new Map(triageOutcome?.decisions || []);
@@ -4125,6 +4168,9 @@ async function streamHandler(req, res) {
           });
           triageTitleMap = buildTriageTitleMap(triageDecisions);
           console.log(`[NZB TRIAGE] Evaluated ${triageOutcome.evaluatedCount}/${triageOutcome.candidatesConsidered} candidate NZBs in ${triageOutcome.elapsedMs} ms (timedOut=${triageOutcome.timedOut})`);
+          if (triageOutcome.racingLadder?.enabled) {
+            console.log('[NZB TRIAGE] Racing ladder outcome', triageOutcome.racingLadder);
+          }
           if (triageDecisions.size > 0) {
             const statusCounts = {};
             let loggedSamples = 0;
@@ -4171,7 +4217,10 @@ async function streamHandler(req, res) {
       );
     }
 
-    if (triageCompleteForCache && shouldAttemptTriage) {
+    // A racing winner is exact evidence even when lower-ranked hedged checks
+    // are still pending. Persist/prefetch that verified NZB immediately; only
+    // the overall search-cache completeness flag must wait for every candidate.
+    if (shouldAttemptTriage) {
       triageEligibleResults.forEach((candidate) => {
         const decision = triageDecisions.get(candidate.downloadUrl);
         if (decision && decision.status === 'verified' && typeof decision.nzbPayload === 'string') {

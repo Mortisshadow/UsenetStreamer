@@ -182,6 +182,8 @@ The dashboard and stream routes are protected by secret tokens. Rotate secrets/t
 - **TMDb/TVDb/anime metadata assist:** `TMDB_ENABLED`, `TMDB_API_KEY`, `TMDB_SEARCH_MODE` (`english_only` / `english_and_regional`), `TMDB_SEARCH_LANGUAGES`, `TVDB_ENABLED`, `TVDB_API_KEY`, plus built-in anime ID mapping support.
 - **Stream protection + health checks:** `NZB_STREAM_PROTECTION`, `NZB_AUTO_ADVANCE_STRATEGY`, `NZB_SMART_PLAY_MODE`, and `NZB_TRIAGE_*` NNTP/triage controls.
 - **Archive-check knobs:** `NZB_TRIAGE_HEALTH_METHOD`, `NZB_TRIAGE_STAT_SAMPLE_COUNT`, and `NZB_TRIAGE_ARCHIVE_SAMPLE_COUNT`.
+- **Adaptive blocking deadline:** `NZB_STREAM_RESPONSE_BUDGET_MS` defaults to 24 seconds. Metadata/indexer/search time is subtracted first and one second is reserved for formatting the Stremio response, so upfront health cannot consume a fresh 25-second budget after a slow search.
+- **Racing health ladder:** enabled by default with `NZB_TRIAGE_RACING_LADDER=true`. Ranked candidate 1 starts immediately and later candidates are hedged by `NZB_TRIAGE_RACING_HEDGE_MS` (650 ms by default). Blocking mode continues as soon as the first exact `verified` decision arrives; already-started checks may finish only to warm the exact-evidence cache.
 
 See `.env.example` for the complete list and defaults.
 
