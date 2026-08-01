@@ -76,6 +76,13 @@
 - Decisions are cached per download URL and per normalized title, so later requests inherit health verdicts instantly.
 - Exact positive health evidence is also reused for 30 minutes by NZB content, provider configuration, episode target, and health policy. This avoids repeated NNTP work for identical NZBs served through different URLs without treating errors or probabilistic guesses as verified.
 
+### 📦 Season-pack search modes
+- **Background (recommended):** returns normal episode results first, then searches packs once per series season. Reopen or refresh the title in Stremio to merge a completed pack snapshot.
+- **Wait for all packs:** preserves the synchronous, fullest-first behavior and may add several seconds to the initial request.
+- **Off:** disables pack-specific queries. Packs also require NZBDav mode because native mode cannot select the requested file inside a multi-episode NZB.
+- Background snapshots are shared across episodes with SingleFlight, a bounded queue, and one global Prowlarr fan-out at a time by default. A successful positive snapshot defaults to 12 hours, a partially successful one to 60 minutes, and a successful empty search to 30 minutes. A 45-second job watchdog prevents a stalled request from blocking the queue forever. The background worker only searches metadata—normal ranking and the configured top-N health limit apply after a later merge.
+- The snapshot cache is process-local. A single Docker instance shares it across all requests; multiple replicas search independently unless they are given a shared cache in a future deployment.
+
 ### 🔐 Secure-by-Default
 - **Admin token** (`ADDON_SHARED_SECRET`) — used to access the admin dashboard where you can edit settings and credentials. Credentials are write-only (never exposed back to the UI).
 - **Stream token** (`ADDON_STREAM_TOKEN`) — a separate token used only for streaming; it cannot access the admin dashboard or modify any settings.

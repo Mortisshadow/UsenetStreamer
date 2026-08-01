@@ -240,6 +240,11 @@
         });
       } else if (element.type === 'number' && rawValue === '') {
         element.value = '';
+      } else if (key === 'NZB_SEASON_PACK_MODE' && rawValue === '') {
+        const legacyValue = values.NZB_INCLUDE_SEASON_PACKS;
+        element.value = legacyValue !== undefined && legacyValue !== '' && !parseBool(legacyValue)
+          ? 'off'
+          : 'background';
       } else {
         element.value = rawValue ?? '';
         applyMaskedDisplay(element, rawValue);

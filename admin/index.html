@@ -426,6 +426,18 @@
                 <strong>Off</strong> shows everything raw. In all dedupe modes, paid-indexer results are preferred over free, then fewer files wins.
               </span>
             </label>
+            <label class="wide-field">Season Pack Search
+              <select name="NZB_SEASON_PACK_MODE">
+                <option value="background" selected>Background — fast first results, packs on refresh (recommended)</option>
+                <option value="wait">Wait for all packs — fullest first result list</option>
+                <option value="off">Off — do not run pack-specific searches</option>
+              </select>
+              <span class="field-hint">
+                Background returns normal episode results immediately and searches packs once per season in the background.
+                Reopen or refresh the Stremio item to see packs after the search completes. If no normal episode is found,
+                the request briefly waits for the pack search as a rescue path. Season packs require NZBDav mode.
+              </span>
+            </label>
             <label class="checkbox">
               <input name="NZB_HIDE_BLOCKED_RESULTS" type="checkbox" />
               <span>

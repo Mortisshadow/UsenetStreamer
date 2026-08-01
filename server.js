@@ -63,6 +63,7 @@ const cache = require('./src/cache');
 const { ensureSharedSecret, ensureAdminSecret, ensureStreamToken, getEffectiveStreamToken } = require('./src/middleware/auth');
 const newznabService = require('./src/services/newznab');
 const easynewsService = require('./src/services/easynews');
+const seasonPackSearch = require('./src/services/seasonPackSearch');
 const { toFiniteNumber, toPositiveInt, toBoolean, parseCommaList, parsePathList, normalizeSortMode, resolvePreferredLanguages, resolveLanguageLabel, resolveLanguageLabels, toSizeBytesFromGb, toSizeBytesFromMb, collectConfigValues, computeManifestUrl, stripTrailingSlashes, decodeBase64Value, deriveSortOrder } = require('./src/utils/config');
 const { normalizeReleaseTitle, parseRequestedEpisode, isVideoFileName, fileMatchesEpisode, normalizeNzbdavPath, inferMimeType, normalizeIndexerToken, nzbMatchesIndexer, cleanSpecialSearchTitle, parseFilterList, normalizeResolutionToken } = require('./src/utils/parsers');
 const { sanitizeErrorForClient, TRIAGE_FINAL_STATUSES, isTriageFinalStatus, buildStreamCacheKey, restoreTriageDecisions, extractTriageOverrides, sleep, annotateNzbResult, applyMaxSizeFilter, prepareSortedResults, getPreferredLanguageMatch, getPreferredLanguageMatches, triageStatusRank, buildTriageTitleMap, prioritizeTriageCandidates, triageDecisionsMatchStatuses, sanitizeDecisionForCache, serializeFinalNzbResults, restoreFinalNzbResults, safeStat, formatStreamTitle } = require('./src/utils/helpers');
@@ -89,6 +90,7 @@ function resolveDedupeMode(env) {
   if (['false', '0', 'off', 'no'].includes(legacy)) return 'off';
   return 'standard';
 }
+
 const { getStreamParamsKey, encodeStreamParams, decodeStreamParams } = require('./src/utils/streamParams');
 const { isNewznabDebugEnabled, isNewznabEndpointLoggingEnabled, logNewznabDebug } = require('./src/services/newznabDebug');
 const { getPaidDirectIndexerTokens, buildPaidIndexerLimitMap } = require('./src/services/newznabIndexerLimits');
@@ -458,6 +460,7 @@ adminApiRouter.post('/config', async (req, res) => {
     // KEEP the on-disk NZB payloads — they stay valid across settings changes and
     // give fast re-mounts without re-downloading from indexers.
     cache.clearTransientCaches('admin-config-save');
+    seasonPackSearch.clear('admin-config-save');
     backgroundTriage.closeAllSessions('admin-config-save');
     autoAdvanceQueue.closeAllSessions('admin-config-save');
     const { portChanged } = rebuildRuntimeConfig();
@@ -540,6 +543,10 @@ adminApiRouter.post('/profiles', (req, res) => {
   try {
     runtimeEnv.updateRuntimeEnv(updates);
     runtimeEnv.applyRuntimeEnv();
+    cache.clearTransientCaches('profile-save');
+    seasonPackSearch.clear('profile-save');
+    backgroundTriage.closeAllSessions('profile-save');
+    autoAdvanceQueue.closeAllSessions('profile-save');
     res.json({ success: true, profile: profileManager.getProfiles().get(newSlug) || null });
   } catch (error) {
     console.error('[ADMIN] Failed to save profile', error);
@@ -562,6 +569,10 @@ adminApiRouter.delete('/profiles/:slug', (req, res) => {
   try {
     runtimeEnv.updateRuntimeEnv(updates);
     runtimeEnv.applyRuntimeEnv();
+    cache.clearTransientCaches('profile-delete');
+    seasonPackSearch.clear('profile-delete');
+    backgroundTriage.closeAllSessions('profile-delete');
+    autoAdvanceQueue.closeAllSessions('profile-delete');
     res.json({ success: true });
   } catch (error) {
     console.error('[ADMIN] Failed to delete profile', error);
@@ -1281,6 +1292,8 @@ const ADMIN_CONFIG_KEYS = [
   'NZB_MAX_RESULT_SIZE_GB',
   'NZB_DEDUP_ENABLED',
   'NZB_DEDUP_MODE',
+  'NZB_SEASON_PACK_MODE',
+  'NZB_INCLUDE_SEASON_PACKS',
   'NZB_HIDE_BLOCKED_RESULTS',
   'NZB_ALLOWED_RESOLUTIONS',
   'NZB_RESOLUTION_LIMIT_PER_QUALITY',
@@ -1430,6 +1443,93 @@ function executeNewznabPlan(plan) {
     });
     throw error;
   });
+}
+
+async function runSeasonPackPlans({ plans, allowedTitles, season, skipManager }) {
+  const sourceOutcomes = [];
+  let successfulPlans = 0;
+  let hadAnyErrors = false;
+  for (const plan of plans) {
+    const startedAt = Date.now();
+    const settled = await Promise.allSettled([
+      executeManagerPlanWithBackoff(plan, skipManager),
+      executeNewznabPlan(plan),
+    ]);
+    const managerSet = settled[0];
+    const newznabSet = settled[1];
+    const managerResults = managerSet?.status === 'fulfilled'
+      ? (Array.isArray(managerSet.value?.results) ? managerSet.value.results : (Array.isArray(managerSet.value) ? managerSet.value : []))
+      : [];
+    const newznabResults = newznabSet?.status === 'fulfilled'
+      ? (Array.isArray(newznabSet.value?.results) ? newznabSet.value.results : (Array.isArray(newznabSet.value) ? newznabSet.value : []))
+      : [];
+    const filteredNewznab = NEWZNAB_FILTER_NZB_ONLY
+      ? newznabResults.filter((item) => item && newznabService.isLikelyNzb(item.downloadUrl))
+      : newznabResults;
+    const errors = [];
+    if (managerSet?.status === 'rejected') errors.push(`manager: ${managerSet.reason?.message || managerSet.reason}`);
+    else if (Array.isArray(managerSet?.value?.errors)) errors.push(...managerSet.value.errors.map((error) => `manager: ${error}`));
+    if (newznabSet?.status === 'rejected') errors.push(`newznab: ${newznabSet.reason?.message || newznabSet.reason}`);
+    else if (Array.isArray(newznabSet?.value?.errors)) errors.push(...newznabSet.value.errors.map((error) => `newznab: ${error}`));
+
+    const combined = [...managerResults, ...filteredNewznab];
+    if (combined.length === 0 && errors.length > 0) {
+      hadAnyErrors = true;
+      sourceOutcomes.push({
+        query: plan.query,
+        status: 'error',
+        durationMs: Date.now() - startedAt,
+        error: errors.join('; '),
+      });
+      continue;
+    }
+    successfulPlans += 1;
+    if (errors.length > 0) hadAnyErrors = true;
+    const seen = new Set();
+    const accepted = combined.flatMap((item) => {
+      if (!item || typeof item !== 'object' || !item.downloadUrl) return [];
+      const title = item.title || item.Title || '';
+      const packInfo = classifyPackTitle(title, season, null);
+      if (!packInfo || !matchesStrictPackTitle(title, allowedTitles, season)) return [];
+      const identity = [item.downloadUrl, title, item.size || item.Size || 0].join('|');
+      if (seen.has(identity)) return [];
+      seen.add(identity);
+      return [{
+        ...item,
+        isSeasonPack: true,
+        packType: packInfo.type || null,
+        packLabel: packInfo.label || null,
+        packRange: packInfo.range || null,
+        packStartEpisode: packInfo.startEpisode ?? null,
+        packEndEpisode: packInfo.endEpisode ?? null,
+        packStartSeason: packInfo.startSeason ?? null,
+        packEndSeason: packInfo.endSeason ?? null,
+      }];
+    });
+    sourceOutcomes.push({
+      query: plan.query,
+      status: errors.length > 0 ? 'partial' : 'ok',
+      total: combined.length,
+      accepted: accepted.length,
+      durationMs: Date.now() - startedAt,
+    });
+    console.log('[PACK-CACHE] Background pack plan completed', {
+      query: plan.query,
+      total: combined.length,
+      accepted: accepted.length,
+      durationMs: Date.now() - startedAt,
+      samples: accepted.slice(0, 5).map((item) => item.title || item.Title || '(untitled)'),
+    });
+    if (accepted.length > 0) return { results: accepted, sourceOutcomes, partial: hadAnyErrors };
+  }
+  if (successfulPlans === 0 || hadAnyErrors) {
+    const error = new Error(successfulPlans === 0
+      ? 'All season-pack search plans failed'
+      : 'Season-pack search was incomplete because one or more sources failed');
+    error.sourceOutcomes = sourceOutcomes;
+    throw error;
+  }
+  return { results: [], sourceOutcomes };
 }
 
 // Configure NZBDav
@@ -1632,8 +1732,8 @@ async function streamHandler(req, res) {
   // Season packs require NZBDav so the addon can select the requested file
   // inside the mounted NZB. Native mode hands the whole NZB to Stremio and
   // therefore cannot guarantee which episode is played.
-  const effIncludeSeasonPacks = effStreamingMode !== 'native'
-    && toBoolean(sortSource.NZB_INCLUDE_SEASON_PACKS, true);
+  const effSeasonPackMode = seasonPackSearch.resolveMode(sortSource, effStreamingMode);
+  const effIncludeSeasonPacks = effSeasonPackMode !== 'off';
   // A native profile on a plain-HTTP addon must be newznab-only (direct indexer HTTPS
   // links — manager links are usually local/HTTP and unplayable). On HTTPS, native serves
   // via the /nzb/fetch proxy so the manager is fine. nzbdav profiles + the default are
@@ -1864,6 +1964,43 @@ async function streamHandler(req, res) {
       console.log(`[ANIME] Using raw anime episode (no DB mapping)`, requestedEpisode);
     }
 
+    const seasonPackCacheKey = effIncludeSeasonPacks
+      && type === 'series'
+      && Number.isFinite(Number(requestedEpisode?.season))
+      ? crypto.createHash('sha256').update(JSON.stringify({
+        version: 1,
+        profile: req.profileName || 'default',
+        ids: {
+          imdb: incomingImdbId || null,
+          tvdb: incomingTvdbId || null,
+          tmdb: incomingTmdbId || null,
+          anime: incomingAnimeId ? `${incomingAnimeId.idType}:${incomingAnimeId.id}` : null,
+          fallback: (!incomingImdbId && !incomingTvdbId && !incomingTmdbId) ? baseIdentifier : null,
+        },
+        season: Number(requestedEpisode.season),
+        sources: {
+          manager: INDEXER_MANAGER,
+          managerUrl: INDEXER_MANAGER_URL || null,
+          managerIndexers: INDEXER_MANAGER_INDEXERS || null,
+          strictId: INDEXER_MANAGER_STRICT_ID_MATCH,
+          direct: (ACTIVE_NEWZNAB_CONFIGS || []).map((config) => ({
+            id: config.id || config.indexerId || config.name || null,
+            url: config.url || config.baseUrl || null,
+            enabled: config.enabled !== false,
+          })),
+        },
+        titlePolicy: {
+          tmdbMode: process.env.TMDB_SEARCH_MODE || null,
+          tmdbLanguages: process.env.TMDB_SEARCH_LANGUAGES || null,
+        },
+      })).digest('hex')
+      : null;
+    const seasonPackSnapshotAtStart = seasonPackCacheKey
+      ? seasonPackSearch.getSnapshot(seasonPackCacheKey)
+      : null;
+    let seasonPackResultsMergedForRequest = false;
+    let seasonPackGenerationMergedForRequest = null;
+
     const streamCacheKey = STREAM_CACHE_MAX_ENTRIES > 0
       ? buildStreamCacheKey({ type, id, requestedEpisode, query: req.query || {}, profileName: req.profileName })
       : null;
@@ -1927,6 +2064,19 @@ async function streamHandler(req, res) {
     let finalNzbResults = [];
     let dedupedSearchResults = [];
     let rawSearchResults = [];
+    let seasonPackSearchScheduledForRequest = Boolean(
+      effSeasonPackMode === 'background' && seasonPackSnapshotAtStart
+    );
+    let seasonPackPlansForRefresh = Array.isArray(cachedSearchMeta?.seasonPackPlans)
+      ? cachedSearchMeta.seasonPackPlans.map((plan) => ({ ...plan }))
+      : [];
+    let seasonPackAllowedTitlesForRefresh = Array.isArray(cachedSearchMeta?.seasonPackAllowedTitles)
+      ? cachedSearchMeta.seasonPackAllowedTitles.slice()
+      : [];
+    let seasonPackJobForRequest = seasonPackSnapshotAtStart?.status === 'pending'
+      ? { promise: seasonPackSnapshotAtStart.promise }
+      : null;
+    let seasonPackRescueWaitAttempted = false;
     let triageDecisions = cachedTriageDecisionMap
       || (cachedSearchMeta
         ? restoreTriageDecisions(cachedSearchMeta.triageDecisionsSnapshot)
@@ -1942,7 +2092,28 @@ async function streamHandler(req, res) {
     const dedupeMode = dedupeBooleanOverride === false ? 'off' : (profileEff ? resolveDedupeMode(sortSource) : INDEXER_DEDUP_MODE);
     const dedupeEnabled = dedupeMode !== 'off';
     if (cachedSearchMeta) {
-      const restored = restoreFinalNzbResults(cachedSearchMeta.finalNzbResults);
+      let restored = restoreFinalNzbResults(cachedSearchMeta.finalNzbResults);
+      if (effSeasonPackMode === 'background') {
+        // Defensive migration for cache entries written before pack results
+        // were separated from the longer-lived episode search cache.
+        restored = restored.filter((result) => result.isSeasonPack !== true);
+      }
+      if (['ready', 'ready_partial'].includes(seasonPackSnapshotAtStart?.status)) {
+        const beforePackMerge = restored.length;
+        restored = seasonPackSearch.mergeSnapshotResults(restored, seasonPackSnapshotAtStart.results, requestedEpisode);
+        seasonPackResultsMergedForRequest = restored.length > beforePackMerge;
+        seasonPackGenerationMergedForRequest = seasonPackSnapshotAtStart.generation;
+        console.log('[PACK-CACHE] Merged ready season-pack snapshot into cached episode search', {
+          generation: seasonPackSnapshotAtStart.generation,
+          addedBeforeDedupe: restored.length - beforePackMerge,
+          season: requestedEpisode?.season ?? null,
+          episode: requestedEpisode?.episode ?? null,
+        });
+      } else if (seasonPackSnapshotAtStart?.status === 'pending') {
+        console.log('[PACK-CACHE] Season-pack search still running; returning cached episode results', {
+          generation: seasonPackSnapshotAtStart.generation,
+        });
+      }
       rawSearchResults = restored.slice();
       dedupedSearchResults = dedupeEnabled
         ? dedupeResultsByTitle(restored, PAID_INDEXER_TOKENS, dedupeMode)
@@ -3075,10 +3246,15 @@ async function streamHandler(req, res) {
 
       // Now execute remaining text-based search plans (exclude already-processed ID plans)
       const remainingPlans = searchPlans.filter(p => !processedIdPlans.has(`${p.type}|${p.query}`));
-      const primaryTextPlans = remainingPlans.filter((plan) => !plan.seasonPackFallback);
-      const fallbackPackPlans = remainingPlans.filter((plan) => plan.seasonPackFallback);
+      const packSearchPlans = remainingPlans.filter((plan) => plan.seasonPack);
+      const foregroundPlans = effSeasonPackMode === 'background'
+        ? remainingPlans.filter((plan) => !plan.seasonPack)
+        : remainingPlans;
+      const primaryTextPlans = foregroundPlans.filter((plan) => !plan.seasonPackFallback);
+      const fallbackPackPlans = foregroundPlans.filter((plan) => plan.seasonPackFallback);
       console.log(`${INDEXER_LOG_PREFIX} Executing ${primaryTextPlans.length} primary text-based search plan(s)`, {
         deferredPackFallbacks: fallbackPackPlans.length,
+        backgroundPackPlans: effSeasonPackMode === 'background' ? packSearchPlans.length : 0,
       });
       const textSearchStartTs = Date.now();
       const executeTextPlanBatch = (plans, phase) => Promise.all(plans.map((plan) => {
@@ -3247,6 +3423,87 @@ async function streamHandler(req, res) {
         }
       }
 
+      const addPackSnapshotToAggregation = (snapshot) => {
+        if (!['ready', 'ready_partial'].includes(snapshot?.status) || !Array.isArray(snapshot.results)) return 0;
+        seasonPackGenerationMergedForRequest = snapshot.generation;
+        const coveredPacks = seasonPackSearch.mergeSnapshotResults([], snapshot.results, requestedEpisode);
+        const existingRawKeys = new Set(rawAggregatedResults
+          .map((entry) => deriveResultKey(entry.result))
+          .filter(Boolean));
+        let added = 0;
+        coveredPacks.forEach((item) => {
+          const key = deriveResultKey(item);
+          if (!key || existingRawKeys.has(key)) return;
+          existingRawKeys.add(key);
+          rawAggregatedResults.push({ result: item, planType: 'season-pack-cache' });
+          if (usingStrictIdMatching) {
+            aggregatedResults.push({ result: item, planType: 'season-pack-cache' });
+            added += 1;
+          } else if (!resultsByKey.has(key)) {
+            resultsByKey.set(key, { result: item, planType: 'season-pack-cache' });
+            added += 1;
+          }
+        });
+        if (coveredPacks.length > 0) {
+          seasonPackResultsMergedForRequest = seasonPackResultsMergedForRequest || added > 0;
+          console.log('[PACK-CACHE] Merged season-pack snapshot into foreground results', {
+            generation: snapshot.generation,
+            covered: coveredPacks.length,
+            uniqueAdded: added,
+            season: requestedEpisode?.season ?? null,
+            episode: requestedEpisode?.episode ?? null,
+          });
+        }
+        return added;
+      };
+
+      if (effSeasonPackMode === 'background' && seasonPackCacheKey && packSearchPlans.length > 0) {
+        seasonPackSearchScheduledForRequest = true;
+        seasonPackPlansForRefresh = packSearchPlans.map((plan) => ({ ...plan }));
+        seasonPackAllowedTitlesForRefresh = packAllowedTitles.slice();
+        const packJob = seasonPackSearch.getOrStart(seasonPackCacheKey, () => runSeasonPackPlans({
+          plans: seasonPackPlansForRefresh,
+          allowedTitles: seasonPackAllowedTitlesForRefresh,
+          season: seasonNum,
+          skipManager: effSkipManager,
+        }));
+        seasonPackJobForRequest = packJob;
+
+        if (packJob.started) {
+          console.log('[PACK-CACHE] Started background season-pack search', {
+            generation: packJob.snapshot?.generation ?? null,
+            plans: packSearchPlans.length,
+            season: seasonNum,
+          });
+          packJob.promise.then((snapshot) => {
+            if (!snapshot) return;
+            console.log('[PACK-CACHE] Background season-pack search published', {
+              status: snapshot.status,
+              generation: snapshot.generation,
+              results: snapshot.results?.length || 0,
+              error: snapshot.error || undefined,
+            });
+          }).catch(() => undefined);
+        } else {
+          console.log('[PACK-CACHE] Reusing season-pack search snapshot/flight', {
+            status: packJob.snapshot?.status || null,
+            generation: packJob.snapshot?.generation ?? null,
+            season: seasonNum,
+          });
+        }
+
+        let availableSnapshot = seasonPackSearch.getSnapshot(seasonPackCacheKey);
+        const foregroundCountBeforePacks = usingStrictIdMatching ? aggregatedResults.length : resultsByKey.size;
+        if (foregroundCountBeforePacks === 0 && availableSnapshot?.status === 'pending') {
+          seasonPackRescueWaitAttempted = true;
+          const rescueWaitMs = Math.max(0, toPositiveInt(process.env.NZB_SEASON_PACK_RESCUE_WAIT_MS, 12000));
+          console.log('[PACK-CACHE] No episode results; waiting for background pack rescue', { timeoutMs: rescueWaitMs });
+          availableSnapshot = await seasonPackSearch.waitForSnapshot(packJob.promise, rescueWaitMs)
+            || seasonPackSearch.getSnapshot(seasonPackCacheKey);
+        }
+        addPackSnapshotToAggregation(availableSnapshot);
+      }
+
       const aggregationCount = usingStrictIdMatching ? aggregatedResults.length : resultsByKey.size;
       const plansRun = planSummaries.length;
       if (aggregationCount === 0) {
@@ -3333,6 +3590,35 @@ async function streamHandler(req, res) {
       });
     }
 
+    // Refresh an expired pack snapshot from the plans stored with the episode
+    // cache. The valid episode results stay on their 72-hour fast path; only
+    // the lightweight background pack query is repeated.
+    if (
+      usingCachedSearchResults
+      && effSeasonPackMode === 'background'
+      && seasonPackCacheKey
+      && !seasonPackSnapshotAtStart
+    ) {
+      if (seasonPackPlansForRefresh.length > 0 && seasonPackAllowedTitlesForRefresh.length > 0) {
+        seasonPackSearchScheduledForRequest = true;
+        seasonPackJobForRequest = seasonPackSearch.getOrStart(seasonPackCacheKey, () => runSeasonPackPlans({
+          plans: seasonPackPlansForRefresh,
+          allowedTitles: seasonPackAllowedTitlesForRefresh,
+          season: seasonNum,
+          skipManager: effSkipManager,
+        }));
+        console.log('[PACK-CACHE] Refreshing expired season-pack snapshot from cached plans', {
+          started: seasonPackJobForRequest.started,
+          generation: seasonPackJobForRequest.snapshot?.generation ?? null,
+          plans: seasonPackPlansForRefresh.length,
+          season: seasonNum,
+        });
+      } else {
+        seasonPackSearchScheduledForRequest = false;
+        console.warn('[PACK-CACHE] Cannot refresh expired snapshot: cached search has no pack plans');
+      }
+    }
+
     // The sort/filter module globals the block reads directly are re-derived here
     // into eff* locals from sortSource (declared near the top of the handler) with
     // the same parsers; buildConfigFromLegacy(sortSource) handles sort + preferred.
@@ -3372,6 +3658,12 @@ async function streamHandler(req, res) {
       episodesInSeason: Number(tmdbMetadata?.seasonEpisodeCounts?.[String(seasonNum)]) || null,
       seasonEpisodeCounts: tmdbMetadata?.seasonEpisodeCounts || {},
     };
+    // Apply the legacy global minimum before the unified filter/rescue stage.
+    // If it removes every episode candidate, the running pack search can still
+    // rescue this first response and its packs pass through the same filters.
+    if (Number.isFinite(INDEXER_MIN_RESULT_SIZE_BYTES) && INDEXER_MIN_RESULT_SIZE_BYTES > 0) {
+      finalNzbResults = finalNzbResults.filter(r => !Number.isFinite(r.size) || r.size >= INDEXER_MIN_RESULT_SIZE_BYTES);
+    }
     finalNzbResults = finalNzbResults.map((result, index) => annotateNzbResult(result, index, annotateContext));
 
     // Sort pipeline.
@@ -3485,6 +3777,34 @@ async function streamHandler(req, res) {
       const filterInputCount = finalNzbResults.length;
       const filterDropLog = [];
       finalNzbResults = filterStreams(finalNzbResults, unified.filters, { dropLog: filterDropLog });
+      if (
+        finalNzbResults.length === 0
+        && !seasonPackRescueWaitAttempted
+        && seasonPackJobForRequest?.promise
+      ) {
+        seasonPackRescueWaitAttempted = true;
+        const rescueWaitMs = Math.max(0, toPositiveInt(process.env.NZB_SEASON_PACK_RESCUE_WAIT_MS, 12000));
+        console.log('[PACK-CACHE] All episode candidates were removed by hard filters; waiting for pack rescue', {
+          timeoutMs: rescueWaitMs,
+        });
+        const rescueSnapshot = await seasonPackSearch.waitForSnapshot(seasonPackJobForRequest.promise, rescueWaitMs)
+          || seasonPackSearch.getSnapshot(seasonPackCacheKey);
+        if (['ready', 'ready_partial'].includes(rescueSnapshot?.status)) {
+          seasonPackGenerationMergedForRequest = rescueSnapshot.generation;
+          const rescuePacks = seasonPackSearch.mergeSnapshotResults([], rescueSnapshot.results, requestedEpisode)
+            .filter((result) => result?.downloadUrl && result?.indexerId)
+            .map((result, index) => annotateNzbResult({ ...result, _sourceType: 'nzb' }, index, annotateContext));
+          const filteredRescuePacks = filterStreams(rescuePacks, unified.filters, { dropLog: filterDropLog });
+          if (filteredRescuePacks.length > 0) {
+            finalNzbResults = filteredRescuePacks;
+            seasonPackResultsMergedForRequest = true;
+            console.log('[PACK-CACHE] Hard-filter rescue added season packs', {
+              generation: rescueSnapshot.generation,
+              added: filteredRescuePacks.length,
+            });
+          }
+        }
+      }
       const droppedPacks = filterDropLog.filter((entry) => entry.seasonPack);
       if (droppedPacks.length > 0) {
         console.log('[SORT][FILTER] 📦 Season packs removed by hard filters:', droppedPacks.slice(0, 10));
@@ -3540,9 +3860,6 @@ async function streamHandler(req, res) {
         allowedResolutions: effAllowedResolutions,
         resolutionLimitPerQuality: effResolutionLimit,
       });
-    }
-    if (Number.isFinite(INDEXER_MIN_RESULT_SIZE_BYTES) && INDEXER_MIN_RESULT_SIZE_BYTES > 0) {
-      finalNzbResults = finalNzbResults.filter(r => !Number.isFinite(r.size) || r.size >= INDEXER_MIN_RESULT_SIZE_BYTES);
     }
     // Per-quality result cap (NZB_RESOLUTION_LIMIT_PER_QUALITY) — the old
     // engine ran this inside prepareSortedResults; the new sort pipeline
@@ -3693,7 +4010,15 @@ async function streamHandler(req, res) {
     const paidIndexerLimitMap = buildCombinedLimitMap(ACTIVE_NEWZNAB_CONFIGS);
     const getIndexerKey = (candidate) => normalizeIndexerToken(candidate?.indexerId || candidate?.indexer);
 
-    if (hasPendingRetries) {
+    if (seasonPackResultsMergedForRequest) {
+      // Re-evaluate the configured top-N window against the combined episode +
+      // pack ranking. Existing verified entries consume their slots, so a new
+      // pack is checked only when it actually lands inside that same budget.
+      triageEligibleResults = prioritizeTriageCandidates(triagePool, TRIAGE_MAX_CANDIDATES, {
+        perIndexerLimitMap: paidIndexerLimitMap,
+        getIndexerKey,
+      });
+    } else if (hasPendingRetries) {
       triageEligibleResults = prioritizeTriageCandidates(triagePool, TRIAGE_MAX_CANDIDATES, {
         shouldInclude: (candidate) => pendingStatuses.has(getDecisionStatus(candidate)),
         perIndexerLimitMap: paidIndexerLimitMap,
@@ -3721,6 +4046,9 @@ async function streamHandler(req, res) {
         }
         return true;
       }
+      // A title match can share general release health between reposts, but it
+      // cannot prove which files a different season-pack NZB contains.
+      if (candidate.isSeasonPack === true) return false;
       const normalizedTitle = normalizeReleaseTitle(candidate.title);
       if (normalizedTitle) {
         const derived = triageTitleMap.get(normalizedTitle);
@@ -3942,10 +4270,21 @@ async function streamHandler(req, res) {
         storedAt: Date.now(),
         triageComplete: isTriageFullyComplete,
         triagePendingDownloadUrls: effectivePendingUrls,
-        finalNzbResults: serializeFinalNzbResults(finalNzbResults),
+        // Background pack lifetime is owned by the season snapshot, not the
+        // longer episode cache. Otherwise a pack merged once would survive in
+        // cached episode results after its snapshot expired.
+        finalNzbResults: serializeFinalNzbResults(
+          effSeasonPackMode === 'background'
+            ? finalNzbResults.filter((result) => result.isSeasonPack !== true)
+            : finalNzbResults
+        ),
         triageDecisionsSnapshot: cacheReadyDecisionEntries,
         movieTitle: movieTitle || null,
         releaseYear: releaseYear || null,
+        seasonPackMode: effSeasonPackMode,
+        seasonPackSearchScheduled: seasonPackSearchScheduledForRequest,
+        seasonPackPlans: seasonPackPlansForRefresh.map((plan) => ({ ...plan })),
+        seasonPackAllowedTitles: seasonPackAllowedTitlesForRefresh.slice(),
       }
       : null;
 
@@ -4031,7 +4370,9 @@ async function streamHandler(req, res) {
       // Episode coverage is specific to this exact NZB. General release health
       // may be shared across equivalent titles, but pack inventory may not.
       const episodeCoverage = result.isSeasonPack === true ? directTriageInfo?.episodeCoverage || null : null;
-      const triageStatus = episodeCoverage?.status === 'missing'
+      const triageStatus = result.isSeasonPack === true && !episodeCoverage
+        ? 'unverified'
+        : episodeCoverage?.status === 'missing'
         ? 'blocked'
         : (episodeCoverage?.status === 'unknown' && releaseTriageStatus === 'verified'
           ? 'unverified'
@@ -4642,6 +4983,28 @@ async function streamHandler(req, res) {
       console.log('[CACHE] Skipping stream cache write for empty stream payload', { type, id });
     }
 
+    if (effSeasonPackMode === 'background' && seasonPackCacheKey) {
+      const latestPackSnapshot = seasonPackSearch.getSnapshot(seasonPackCacheKey);
+      const latestIsReady = ['ready', 'ready_partial'].includes(latestPackSnapshot?.status);
+      const payloadIncludesLatestGeneration = latestIsReady
+        && seasonPackGenerationMergedForRequest === latestPackSnapshot.generation;
+      if (
+        latestPackSnapshot?.status === 'pending'
+        || (latestIsReady && !payloadIncludesLatestGeneration)
+        || (seasonPackSearchScheduledForRequest && !latestPackSnapshot)
+      ) {
+        // Stremio must ask again before a completed pack snapshot can appear;
+        // avoid a client/proxy retaining the provisional episode-only payload.
+        res.set('Cache-Control', 'no-store');
+        res.set('X-UsenetStreamer-Pack-Search', latestIsReady ? 'ready-refresh' : 'pending');
+      } else if (latestIsReady) {
+        res.set('X-UsenetStreamer-Pack-Search', latestPackSnapshot.status);
+      } else if (latestPackSnapshot?.status === 'negative') {
+        res.set('X-UsenetStreamer-Pack-Search', 'negative');
+      } else if (latestPackSnapshot?.status === 'transient_error') {
+        res.set('X-UsenetStreamer-Pack-Search', 'error-retry');
+      }
+    }
     res.json(responsePayload);
 
     // Background triage: start health checking after the response is sent
