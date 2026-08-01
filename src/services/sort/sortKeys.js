@@ -387,6 +387,13 @@ function valueForCriterion(criterion, stream, context = {}) {
       return stream._keywordMatched ? 1 : 0;
     }
 
+    case 'rankScore':
+    case 'streamExpressionScore':
+      return Number.isFinite(stream._rankTotalScore) ? stream._rankTotalScore : 0;
+
+    case 'streamExpressionMatched':
+      return Array.isArray(stream._rankMatched) && stream._rankMatched.length > 0 ? 1 : 0;
+
     // Not relevant for our addon — kept here so an imported config that lists
     // these keys doesn't blow up. Always returns 0 so the criterion is a no-op.
     // `bitrate` lives here too: it's still supported as a numeric *filter*
@@ -406,8 +413,6 @@ function valueForCriterion(criterion, stream, context = {}) {
     case 'streamType':
     case 'regexPatterns':
     case 'regexScore':
-    case 'streamExpressionScore':
-    case 'streamExpressionMatched':
       return 0;
 
     default:

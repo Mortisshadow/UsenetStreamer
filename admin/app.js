@@ -2331,6 +2331,8 @@
   const sortImportStatus = document.getElementById('sortImportStatus');
   const sortImportTextarea = document.getElementById('sortImportConfigTextarea');
   const sortImportAdvanced = document.getElementById('sortImportAdvanced');
+  const rankedRulesTextarea = document.getElementById('rankedRulesTextarea');
+  const germanRankPresetButton = document.getElementById('germanRankPresetButton');
 
   function setSortImportStatus(text, isError = false) {
     if (!sortImportStatus) return;
@@ -2378,6 +2380,8 @@
         ${pref.releaseGroups && pref.releaseGroups.length ? `<div><strong>Preferred release groups:</strong> ${renderList(pref.releaseGroups)}</div>` : ''}
         <div><strong>Excluded qualities:</strong> ${renderList(excl.qualities)}</div>
         <div><strong>Excluded visual tags:</strong> ${renderList(excl.visualTags)}</div>
+        <div><strong>Ranked regex rules:</strong> ${(data.rules?.rankedRegexPatterns || []).length}</div>
+        <div><strong>Ranked SEL rules:</strong> ${(data.rules?.rankedStreamExpressions || []).length}</div>
       </div>
       ${warningsHtml}
     `;
@@ -2514,6 +2518,11 @@
     setTextareaLines('requiredRegexTextarea', requiredPatterns);
     setTextareaLines('excludedRegexTextarea', excludedPatterns);
 
+    if (parsed.rules && rankedRulesTextarea) {
+      const hasRankedRules = (parsed.rules.rankedRegexPatterns || []).length || (parsed.rules.rankedStreamExpressions || []).length;
+      if (hasRankedRules) rankedRulesTextarea.value = JSON.stringify(parsed.rules, null, 2);
+    }
+
     // Strip the import JSON textarea — only keep per-type sort criteria that
     // can't be shown in the basic UI. If nothing remains, clear it entirely.
     const perTypeKeys = ['movies', 'series', 'anime', 'cached', 'uncached',
@@ -2577,6 +2586,27 @@
           setSortImportStatus(err?.message || 'Import request failed', true);
           renderSortImportPreview(null);
         });
+    });
+  }
+
+  if (germanRankPresetButton && rankedRulesTextarea) {
+    germanRankPresetButton.addEventListener('click', () => {
+      const preset = {
+        rankedRegexPatterns: [
+          { id: 'german-marker', name: 'German release marker', pattern: '(?:^|[ ._\\-])(GERMAN|GER|DEU|DEUTSCH)(?:$|[ ._\\-])', flags: 'i', score: 150, enabled: true, mode: 'score' },
+        ],
+        rankedStreamExpressions: [
+          { id: 'german-language', name: 'German language', expression: "language(streams, 'German', 'de', 'deu', 'ger', 'Deutsch')", score: 300, enabled: true },
+          { id: 'multi-language', name: 'Multi or dual audio', expression: "language(streams, 'Multi', 'Dual Audio')", score: 100, enabled: true },
+          { id: 'resolution-2160p', name: '2160p', expression: "resolution(streams, '2160p')", score: 80, enabled: true },
+          { id: 'resolution-1080p', name: '1080p', expression: "resolution(streams, '1080p')", score: 50, enabled: true },
+          { id: 'resolution-720p', name: '720p', expression: "resolution(streams, '720p')", score: 20, enabled: true },
+          { id: 'hevc', name: 'HEVC', expression: "encode(streams, 'HEVC', 'x265', 'h265')", score: 25, enabled: true },
+        ],
+      };
+      rankedRulesTextarea.value = JSON.stringify(preset, null, 2);
+      rankedRulesTextarea.focus();
+      syncSaveGuard();
     });
   }
 

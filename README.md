@@ -44,6 +44,7 @@
 - **Stream Protection modes** — unified protection selector in the dashboard: `none`, `auto-advance`, `health-check`, `health-check-auto-advance`, `smart-play-only`, and `smart-play`.
 - **Smart Play (background triage)** — background health checks add a dedicated Smart Play stream that can auto-pick healthy candidates while checks continue.
 - **Custom sorting chain** — `NZB_SORT_ORDER` drives result ordering with any combination of: `language`, `release_group`, `size`, `resolution`, `quality`, `encode`, `visual_tag`, `audio_tag`, `keyword`, `date`, `files`. Default chain: `quality,size,files`.
+- **Ranked rules (SEL)** — optional Ultimate-compatible Regex and safe Stream Expression Language rules add or subtract points before the normal sorting chain. The dashboard includes a German + quality starter preset.
 - **Per-indexer capability gating** — ID-based plans run only on indexers that advertise required caps support (e.g., skip `imdbid` tvsearch where unsupported).
 - **Anime ID support** — accepts `kitsu:`, `mal:`, and `anilist:` IDs and resolves them to IMDb/TVDb via bundled mapping databases (Fribb, Kitsu-IMDB, Manami).
 
@@ -166,7 +167,7 @@ The dashboard and stream routes are protected by secret tokens. Rotate secrets/t
 - **Indexer sources:** `INDEXER_MANAGER` (`none`, `prowlarr`, `nzbhydra`), `INDEXER_MANAGER_URL`, `INDEXER_MANAGER_API_KEY`, `INDEXER_MANAGER_INDEXERS`, `INDEXER_MANAGER_STRICT_ID_MATCH`.
 - **Direct Newznab mode:** `NEWZNAB_ENABLED`, `NEWZNAB_FILTER_NZB_ONLY`, numbered `NEWZNAB_*` entries, optional `NEWZNAB_CAPS_CACHE`.
 - **Addon security + routing:** `ADDON_BASE_URL` (HTTPS), `ADDON_SHARED_SECRET` (required), optional `ADDON_STREAM_TOKEN` (separate stream token).
-- **Sorting + filtering:** `NZB_SORT_MODE` (legacy/back-compat), `NZB_SORT_ORDER` (priority chain, default `quality,size,files`), `NZB_PREFERRED_LANGUAGE`, `NZB_DEDUP_ENABLED`, `NZB_MAX_RESULT_SIZE_GB`, `NZB_ALLOWED_RESOLUTIONS`, `NZB_RESOLUTION_LIMIT_PER_QUALITY`, `NZB_RELEASE_EXCLUSIONS`.
+- **Sorting + filtering:** `NZB_SORT_MODE` (legacy/back-compat), `NZB_SORT_ORDER` (priority chain, default `quality,size,files`), `NZB_RANKED_RULES` (optional Regex/SEL point rules JSON), `NZB_PREFERRED_LANGUAGE`, `NZB_DEDUP_ENABLED`, `NZB_MAX_RESULT_SIZE_GB`, `NZB_ALLOWED_RESOLUTIONS`, `NZB_RESOLUTION_LIMIT_PER_QUALITY`, `NZB_RELEASE_EXCLUSIONS`.
 - **Stream naming:** `NZB_DISPLAY_NAME_PATTERN`, `NZB_NAMING_PATTERN` with token-list support (`title`, `stream_quality`, `source`, `codec`, `group`, `size`, `files`, `date`, `languages`, `indexer`, `health`, etc.).
 - **NZBDav:** `NZBDAV_URL`, `NZBDAV_API_KEY`, WebDAV credentials, category controls, and history/cache options.
 - **Easynews:** `EASYNEWS_ENABLED`, `EASYNEWS_USERNAME`, `EASYNEWS_PASSWORD`, optional size/text-mode flags.

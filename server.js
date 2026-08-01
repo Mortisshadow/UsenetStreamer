@@ -1276,6 +1276,7 @@ const ADMIN_CONFIG_KEYS = [
   'NZB_PREFERRED_AUDIO_TAGS',
   'NZB_PREFERRED_AUDIO_CHANNELS',
   'NZB_PREFERRED_KEYWORDS',
+  'NZB_RANKED_RULES',
   'NZB_MAX_RESULT_SIZE_GB',
   'NZB_DEDUP_ENABLED',
   'NZB_DEDUP_MODE',
@@ -3235,6 +3236,7 @@ async function streamHandler(req, res) {
       const { sortStreams } = require('./src/services/sort/sortEngine');
       const { filterStreams } = require('./src/services/sort/filter');
       const { precomputeMatches } = require('./src/services/sort/precompute');
+      const { applyRankedRules, parseRulesConfig } = require('./src/services/rules/rankEngine');
 
       let unified;
       const rawConfig = (sortSource.NZB_AIO_SORT_CONFIG || '').trim();
@@ -3245,6 +3247,7 @@ async function streamHandler(req, res) {
           preferred: imported.preferred,
           filters: imported.filters,
           expressions: imported.expressions,
+          rules: imported.rules,
           source: 'imported',
         };
       } else {
@@ -3316,8 +3319,15 @@ async function streamHandler(req, res) {
           expressions: {
             keywords: effPreferredKeywords || [],
           },
+          rules: parseRulesConfig(sortSource.NZB_RANKED_RULES || ''),
           source: 'legacy-migrated',
         };
+      }
+
+      // A dedicated rules field overrides rules embedded in a sort import. It
+      // lets users edit scoring without having to replace the whole import.
+      if ((sortSource.NZB_RANKED_RULES || '').trim()) {
+        unified.rules = parseRulesConfig(sortSource.NZB_RANKED_RULES);
       }
 
       // Note: we deliberately do NOT auto-activate `keyword`. Legacy users may
@@ -3339,16 +3349,27 @@ async function streamHandler(req, res) {
         console.log(`[SORT][FILTER] dropped ALL ${filterInputCount} results — by gate:`, reasonHist);
         console.log('[SORT][FILTER] samples:', filterDropLog.slice(0, 5).map((d) => `${d.reason}  ←  ${d.title}`));
       }
-      precomputeMatches(finalNzbResults, {
-        preferredKeywordsPatterns: unified.expressions?.keywords || [],
-      });
       // Detect anime via Kitsu/MAL ID prefix — Stremio still sends type='series' for anime.
       const isAnimeContent = typeof id === 'string' && animeDatabase.isAnimeId(id);
       const sortType = isAnimeContent ? 'anime' : (type === 'series' ? 'series' : 'movie');
+      const ranked = applyRankedRules(finalNzbResults, unified.rules, {
+        queryType: type === 'series' ? 'series' : 'movie',
+        constants: { isAnime: isAnimeContent },
+      });
+      finalNzbResults = ranked.results;
+      if (ranked.errors.length) console.warn('[RANK] Rule errors:', ranked.errors.slice(0, 10));
+      if (ranked.active) {
+        const topScores = finalNzbResults.slice().sort((a, b) => (b._rankTotalScore || 0) - (a._rankTotalScore || 0)).slice(0, 5)
+          .map((result) => `${result._rankTotalScore || 0}:${result.title || result.name || '(untitled)'}`);
+        console.log(`[RANK] active results=${finalNzbResults.length} top=${topScores.join(' | ')}`);
+      }
+      precomputeMatches(finalNzbResults, {
+        preferredKeywordsPatterns: unified.expressions?.keywords || [],
+      });
       finalNzbResults = sortStreams(finalNzbResults, {
         sortCriteria: unified.sortCriteria,
         preferred: unified.preferred,
-      }, { type: sortType });
+      }, { type: sortType, rankScoreFirst: ranked.active });
       console.log(`[SORT] source=${unified.source} sorted=${finalNzbResults.length}`);
     } catch (error) {
       console.error('[SORT] Sort engine failed, falling back to legacy:', error?.message || error);

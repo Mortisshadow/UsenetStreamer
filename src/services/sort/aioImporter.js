@@ -13,6 +13,7 @@ const APPLICABLE_SORT_KEYS = new Set([
   'size', 'age', 'resolution', 'quality',
   'encode', 'releaseGroup', 'visualTag', 'audioTag', 'audioChannel',
   'language', 'keyword',
+  'rankScore',
   'streamExpressionMatched', 'streamExpressionScore',
 ]);
 
@@ -240,7 +241,12 @@ function importAioConfig(input) {
     keywords: pickPatternArray(raw, 'preferredKeywordsPatterns'),
   };
 
-  return { sortCriteria, preferred, filters, expressions, warnings };
+  // Ultimate-compatible ranked rules can live at the top level or below a
+  // filter/rules wrapper depending on which exporter produced the backup.
+  const { parseRulesConfig } = require('../rules/rankEngine');
+  const rules = parseRulesConfig(raw);
+
+  return { sortCriteria, preferred, filters, expressions, rules, warnings };
 }
 
 module.exports = {

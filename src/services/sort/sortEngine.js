@@ -134,6 +134,9 @@ function sortStreams(streams, userConfig = {}, context = {}) {
     // fall back to the default resolution→size sort instead of leaving the
     // list in raw indexer order.
     if (criteria.length === 0) criteria = DEFAULT_SORT_CRITERIA;
+    if (context.rankScoreFirst && !criteria.some((criterion) => criterion.key === 'rankScore' || criterion.key === 'streamExpressionScore')) {
+      criteria = [{ key: 'rankScore', direction: 'desc' }, ...criteria];
+    }
     const keyContext = { preferred };
     const keyed = streams.map((stream) => ({ stream, key: dynamicSortKey(stream, criteria, keyContext) }));
     keyed.sort((a, b) => compareKeys(a.key, b.key));
@@ -150,8 +153,12 @@ function sortStreams(streams, userConfig = {}, context = {}) {
   }
   const keyContext = { preferred };
   const sortBy = (group, state) => {
-    const crit = pickCriteria(sortCriteria, type, state);
+    let crit = pickCriteria(sortCriteria, type, state);
+    if (crit.length === 0 && context.rankScoreFirst) crit = DEFAULT_SORT_CRITERIA;
     if (crit.length === 0) return group;
+    if (context.rankScoreFirst && !crit.some((criterion) => criterion.key === 'rankScore' || criterion.key === 'streamExpressionScore')) {
+      crit = [{ key: 'rankScore', direction: 'desc' }, ...crit];
+    }
     const keyed = group.map((stream) => ({ stream, key: dynamicSortKey(stream, crit, keyContext) }));
     keyed.sort((a, b) => compareKeys(a.key, b.key));
     return keyed.map((entry) => entry.stream);

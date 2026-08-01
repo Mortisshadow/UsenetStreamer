@@ -626,6 +626,23 @@
 
             <div class="advanced-filters" style="margin-top: 1rem;">
               <div class="advanced-filters-header">
+                <span>Ranked Rules (SEL)</span>
+                <span class="field-hint">Optional point system compatible with Usenet Ultimate rules. Positive scores boost a result, negative scores penalize it. Ranked score is applied before the normal sort priorities.</span>
+              </div>
+              <div class="field-grid">
+                <label class="wide-field">Ranked Rules JSON
+                  <textarea name="NZB_RANKED_RULES" id="rankedRulesTextarea" class="pattern-input" rows="12" placeholder='{"rankedStreamExpressions":[{"name":"German","expression":"language(streams, &quot;German&quot;)","score":300}]}'></textarea>
+                  <span class="field-hint">Supports <code>rankedRegexPatterns</code> (score/keep/drop) and <code>rankedStreamExpressions</code>. SEL functions include <code>language</code>, <code>resolution</code>, <code>quality</code>, <code>encode</code>, <code>visualTag</code>, <code>audioTag</code>, <code>releaseGroup</code>, <code>size</code>, <code>bitrate</code>, <code>seasonPack</code>, <code>regexMatched</code>, <code>merge</code> and <code>negate</code>.</span>
+                </label>
+              </div>
+              <div class="inline-actions">
+                <button type="button" class="secondary" id="germanRankPresetButton">Load German + Quality preset</button>
+                <span class="field-hint">Replaces the text above; Save Changes is still required.</span>
+              </div>
+            </div>
+
+            <div class="advanced-filters" style="margin-top: 1rem;">
+              <div class="advanced-filters-header">
                 <span>Regex Patterns</span>
                 <span class="field-hint">Filter and sort streams by regular expressions. Each line is one pattern, matched (case-insensitive) against the filename, release group, and indexer name. Prefix with <code>!</code> to negate a single pattern.</span>
               </div>
