@@ -525,6 +525,7 @@ async function getMetadataAndTitles({ imdbId, tmdbId, type }) {
   let releaseYear = null;
   let runtimeMinutes = null;
   let seasonEpisodeCounts = {};
+  let alternativeTitles = [];
 
   if (usingImdb && !resolvedTmdbId) {
     // Step 1: Find TMDb ID from IMDb ID
@@ -553,6 +554,7 @@ async function getMetadataAndTitles({ imdbId, tmdbId, type }) {
     releaseYear = details.releaseYear || null;
     runtimeMinutes = details.runtimeMinutes ?? null;
     seasonEpisodeCounts = details.seasonEpisodeCounts || {};
+    alternativeTitles = details.alternativeTitles || [];
     console.log(`[TMDB] Using TMDb ID ${resolvedTmdbId} (${mediaType}), original: "${originalTitle}" [${originalLanguage}], year: ${releaseYear}`);
   }
 
@@ -567,6 +569,9 @@ async function getMetadataAndTitles({ imdbId, tmdbId, type }) {
       }
       if (details?.seasonEpisodeCounts) {
         seasonEpisodeCounts = details.seasonEpisodeCounts;
+      }
+      if (Array.isArray(details?.alternativeTitles)) {
+        alternativeTitles = details.alternativeTitles;
       }
     } catch (error) {
       console.warn(`[TMDB] Runtime backfill failed for ${resolvedTmdbId}:`, error.message);
@@ -674,6 +679,12 @@ async function getMetadataAndTitles({ imdbId, tmdbId, type }) {
     year: releaseYear,
     runtimeMinutes,
     seasonEpisodeCounts,
+    alternativeTitles: alternativeTitles
+      .filter((entry) => entry?.title)
+      .map((entry) => ({
+        ...entry,
+        asciiTitle: normalizeToAscii(entry.title),
+      })),
     titles,
   };
 }

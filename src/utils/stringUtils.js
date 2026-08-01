@@ -96,6 +96,53 @@ function matchesStrictSearch(title, strictPhrase) {
   return true;
 }
 
+function romanToInteger(token) {
+  const values = { I: 1, V: 5, X: 10 };
+  const raw = String(token || '').toUpperCase();
+  if (!/^[IVX]+$/.test(raw)) return null;
+  let total = 0;
+  for (let i = 0; i < raw.length; i += 1) {
+    const value = values[raw[i]];
+    const next = values[raw[i + 1]] || 0;
+    total += value < next ? -value : value;
+  }
+  return total;
+}
+
+// Pack titles need an exact show-core comparison, but release-group tags and
+// season sequel notation must not make valid packs disappear. Everything from
+// the first explicit season marker onward is release metadata. Extra words
+// before it remain significant, which rejects spin-offs such as Vigilante.
+function normalizePackCoreTitle(title, requestedSeason, { stripReleaseYear = false } = {}) {
+  let raw = foldAccents(String(title || '')).trim();
+  while (/^\[[^\]\r\n]{1,64}\]\s*/.test(raw)) {
+    raw = raw.replace(/^\[[^\]\r\n]{1,64}\]\s*/, '');
+  }
+  const marker = raw.match(/(?:^|[\s._-])(?:s\d{1,3}(?=e\d|$|[\s._-])|season[\s._-]*\d{1,3}(?=$|[\s._-])|\d{1,3}x\d{1,4}(?=$|[\s._-]))/i);
+  if (marker?.index !== undefined) raw = raw.slice(0, marker.index);
+
+  const tokens = sanitizeStrictSearchPhrase(raw).split(' ').filter(Boolean);
+  const season = Number(requestedSeason);
+  if (stripReleaseYear && tokens.length > 1 && /^(?:19|20)\d{2}$/.test(tokens[tokens.length - 1])) {
+    tokens.pop();
+  }
+  if (tokens.length > 1 && Number.isFinite(season)) {
+    const romanSeason = romanToInteger(tokens[tokens.length - 1]);
+    if (romanSeason === season) tokens.pop();
+  }
+  return tokens.join(' ');
+}
+
+function matchesStrictPackTitle(candidateTitle, allowedTitles, requestedSeason) {
+  const candidateCores = new Set([
+    normalizePackCoreTitle(candidateTitle, requestedSeason),
+    normalizePackCoreTitle(candidateTitle, requestedSeason, { stripReleaseYear: true }),
+  ].filter(Boolean));
+  if (candidateCores.size === 0) return false;
+  const allowed = Array.isArray(allowedTitles) ? allowedTitles : [allowedTitles];
+  return allowed.some((title) => candidateCores.has(normalizePackCoreTitle(title, requestedSeason)));
+}
+
 function normaliseTitle(text, lang) {
   if (!text) return '';
   return foldAccents(String(text).replace(/&/g, ampersandWord(lang)))
@@ -150,6 +197,8 @@ module.exports = {
   sanitizeStrictSearchPhrase,
   cleanSearchTitle,
   matchesStrictSearch,
+  normalizePackCoreTitle,
+  matchesStrictPackTitle,
   normaliseTitle,
   levenshteinDistance,
   levenshteinRatio,

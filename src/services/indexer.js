@@ -1,5 +1,6 @@
 // Indexer service - Prowlarr and NZBHydra integration
 const axios = require('axios');
+const { redactSensitiveString } = require('../utils/logSanitizer');
 const { getPublishMetadataFromResult, areReleasesWithinDays } = require('../utils/publishInfo');
 const { buildProxyAgents } = require('../utils/proxyAgent');
 
@@ -101,7 +102,7 @@ async function executeProwlarrSearch(plan) {
   const serializedParams = urlSearchParams.toString();
   const requestUrl = `${INDEXER_MANAGER_BASE_URL}/api/v1/search`;
   const fullUrl = serializedParams ? `${requestUrl}?${serializedParams}` : requestUrl;
-  console.log('[PROWLARR] Requesting search', { url: fullUrl });
+  console.log('[PROWLARR] Requesting search', { url: redactSensitiveString(fullUrl) });
   const response = await axios.get(fullUrl, {
     headers: { 'X-Api-Key': INDEXER_MANAGER_API_KEY },
     timeout: 60000,

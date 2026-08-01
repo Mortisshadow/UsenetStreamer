@@ -5,6 +5,7 @@ const { getDownloadUserAgentForIndexer, getProxyForIndexer } = require('../newzn
 const { getManagerProxy } = require('../indexer');
 const { proxiedGet } = require('../../utils/proxyAgent');
 const diskNzbCache = require('../../cache/diskNzbCache');
+const { sanitizeLogValue } = require('../../utils/logSanitizer');
 
 const DEFAULT_TIME_BUDGET_MS = 40000;
 const DEFAULT_MAX_CANDIDATES = 25;
@@ -34,7 +35,7 @@ function normalizeTitle(title) {
 
 function logEvent(logger, level, message, context) {
   if (!logger) return;
-  const payload = context && Object.keys(context).length > 0 ? context : undefined;
+  const payload = context && Object.keys(context).length > 0 ? sanitizeLogValue(context) : undefined;
   if (typeof logger === 'function') {
     logger(level, message, payload);
     return;
@@ -445,6 +446,10 @@ async function triageAndRank(nzbResults, options = {}) {
             indexerName: candidate.indexerName,
             title: candidate.title,
             durationMs: elapsed,
+            timeoutMs: downloadTimeoutMs,
+            reason: err?.code === 'ERR_CANCELED' || err?.message === 'canceled'
+              ? 'download-timeout'
+              : 'download-error',
           });
           continue;
         }

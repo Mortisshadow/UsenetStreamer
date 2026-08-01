@@ -31,6 +31,9 @@ function canonicalizeLanguage(value) {
  *   titles almost never carry explicit bitrate, so this calculation is the
  *   only way the Max-Bitrate filter and Bitrate sort key produce useful
  *   results for most streams.
+ * @param {object} [context.seasonEpisodeCounts] - TMDb episode counts keyed by
+ *   season number, used to estimate the per-episode size of multi-season and
+ *   complete-series packs.
  */
 function annotateNzbResult(result, sortIndex = 0, context = {}) {
   if (!result || typeof result !== 'object') return result;
@@ -68,9 +71,43 @@ function annotateNzbResult(result, sortIndex = 0, context = {}) {
   const episodesInSeason = context && Number.isFinite(context.episodesInSeason) && context.episodesInSeason > 0
     ? context.episodesInSeason
     : null;
-  const estimatedEpisodeSize = result.isSeasonPack && sizeBytes && episodesInSeason
-    ? Math.round(sizeBytes / episodesInSeason)
-    : null;
+  let estimatedEpisodeSize = null;
+  if (result.isSeasonPack && sizeBytes) {
+    const seasonEpisodeCounts = context?.seasonEpisodeCounts && typeof context.seasonEpisodeCounts === 'object'
+      ? context.seasonEpisodeCounts
+      : {};
+    const episodeRangeCount = result.packType === 'episode-range'
+      && Number.isFinite(result.packStartEpisode)
+      && Number.isFinite(result.packEndEpisode)
+      ? Math.abs(result.packEndEpisode - result.packStartEpisode) + 1
+      : null;
+    const multiSeasonEpisodeCount = result.packType === 'multi-season'
+      && Number.isFinite(result.packStartSeason)
+      && Number.isFinite(result.packEndSeason)
+      ? Object.entries(seasonEpisodeCounts).reduce((total, [seasonNumber, count]) => {
+        const numericSeason = Number(seasonNumber);
+        const numericCount = Number(count);
+        return numericSeason >= result.packStartSeason
+          && numericSeason <= result.packEndSeason
+          && Number.isFinite(numericCount)
+          ? total + numericCount
+          : total;
+      }, 0)
+      : null;
+    const completeSeriesEpisodeCount = result.packType === 'multi-season'
+      && result.packRange === 'Complete Series'
+      ? Object.entries(seasonEpisodeCounts).reduce((total, [seasonNumber, count]) => {
+        const numericSeason = Number(seasonNumber);
+        const numericCount = Number(count);
+        return numericSeason > 0 && Number.isFinite(numericCount) ? total + numericCount : total;
+      }, 0)
+      : null;
+    const divisor = episodeRangeCount
+      || completeSeriesEpisodeCount
+      || multiSeasonEpisodeCount
+      || episodesInSeason;
+    if (divisor) estimatedEpisodeSize = Math.round(sizeBytes / divisor);
+  }
   const bitrateSizeBytes = estimatedEpisodeSize || sizeBytes;
   if (runtimeMinutes && runtimeMinutes > 0 && bitrateSizeBytes && bitrateSizeBytes > 0) {
     derivedBitrate = Math.round((bitrateSizeBytes * 8) / (runtimeMinutes * 60));

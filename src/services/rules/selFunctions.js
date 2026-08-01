@@ -67,6 +67,7 @@ const BUILTIN_FUNCTIONS = {
   age: (args) => numericRange(args, 'age', true),
   bitrate: (args) => numericRange(args, 'bitrate', false),
   seasonPack: (args) => streamsFrom(args[0]).filter((stream) => stream.attrs?.seasonPack === true),
+  packType: (args) => filterAttribute(args, 'packType'),
   negate: (args) => { const excluded = new Set(streamsFrom(args[0]).map((stream) => stream.ref)); return streamsFrom(args[1]).filter((stream) => !excluded.has(stream.ref)); },
   merge: (args) => { const seen = new Set(); return args.flatMap(streamsFrom).filter((stream) => !seen.has(stream.ref) && seen.add(stream.ref)); },
   slice: (args) => streamsFrom(args[0]).slice(Number(args[1]) || 0, args.length > 2 ? Number(args[2]) : undefined),

@@ -48,6 +48,22 @@ test('German language and quality points add up and sort before normal criteria'
   assert.equal(sorted[0], german1080);
 });
 
+test('SEL can score all packs or only a specific pack type', () => {
+  const season = result('Show Season 2', { isSeasonPack: true, packType: 'season' });
+  const batch = result('Show Episodes 1-5', { isSeasonPack: true, packType: 'episode-range' });
+  const single = result('Show S02E05');
+  const rules = {
+    rankedStreamExpressions: [
+      { name: 'Any pack', expression: 'seasonPack(streams)', score: 10 },
+      { name: 'Full season', expression: "packType(streams, 'season')", score: 40 },
+    ],
+  };
+  applyRankedRules([season, batch, single], rules);
+  assert.equal(season._rankTotalScore, 50);
+  assert.equal(batch._rankTotalScore, 10);
+  assert.equal(single._rankTotalScore, 0);
+});
+
 test('regex tags feed SEL scoring and keep/drop modes filter the pool', () => {
   const goodGerman = result('Movie.GERMAN.1080p');
   const blockedGerman = result('Movie.GERMAN.CAM');

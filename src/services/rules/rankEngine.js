@@ -110,6 +110,7 @@ function buildStreamContext(result) {
     seeders: null,
     bitrate: Number.isFinite(result.bitrate) ? result.bitrate : null,
     seasonPack: result.isSeasonPack === true,
+    packType: String(result.packType || ''),
   };
 }
 function addScore(current, delta) { return clamp(current + delta, TOTAL_SCORE_CAP); }

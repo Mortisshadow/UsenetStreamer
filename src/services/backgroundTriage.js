@@ -10,6 +10,7 @@
 
 const { triageAndRank } = require('./triage/runner');
 const autoAdvanceQueue = require('./autoAdvanceQueue');
+const { redactSensitiveString } = require('../utils/logSanitizer');
 
 const TRIAGE_BATCH_DELAY_MS = 500;
 const DEFAULT_MAX_EVALUATE = 12;
@@ -144,6 +145,7 @@ class BackgroundTriageSession {
     // Stats
     this.evaluated = 0;        // total decisions received (including fetch-errors)
     this.healthChecked = 0;    // only real NNTP health checks (verified/blocked/unverified)
+    this.attemptsStarted = 0;  // NZB fetch/triage attempts; hard UI budget, including retries/errors
     this.totalCandidates = candidates.length;
 
     // In-memory cache of downloaded NZB payloads to avoid re-downloading on retries
@@ -400,6 +402,7 @@ class BackgroundTriageSession {
   getProgress() {
     return {
       evaluated: this.evaluated,
+      attemptsStarted: this.attemptsStarted,
       healthChecked: this.healthChecked,
       total: this.totalCandidates,
       verified: this.verifiedUrls.length,
@@ -434,11 +437,11 @@ class BackgroundTriageSession {
 
     try {
       // --- Phase 1: Process batches until we find verified NZBs or exhaust budget ---
-      while (!this.closed && this.healthChecked < this.maxEvaluate) {
-        const batch = this._buildNextBatch(cursor, retryQueue);
+      while (!this.closed && this.attemptsStarted < this.maxEvaluate) {
+        const batch = this._claimAttemptBudget(this._buildNextBatch(cursor, retryQueue));
         if (batch.length === 0) break;
 
-        console.log(`[BG-TRIAGE] Batch of ${batch.length} (health-checked=${this.healthChecked}/${this.maxEvaluate}, verified=${this.verifiedUrls.length}, cursor=${cursor.index}/${this.allCandidates.length})`);
+        console.log(`[BG-TRIAGE] Batch of ${batch.length} (attempts=${this.attemptsStarted}/${this.maxEvaluate}, health-checked=${this.healthChecked}, verified=${this.verifiedUrls.length}, cursor=${cursor.index}/${this.allCandidates.length})`);
 
         let batchVerified = 0;
         let batchHealthChecked = 0;
@@ -467,7 +470,9 @@ class BackgroundTriageSession {
             this.decisions.set(url, decision);
             this.blockedUrls.add(url);
           } else if (TRANSIENT_STATUSES.has(status)) {
-            // Transient failure (fetch-error, timeout, etc.) — does NOT count toward budget
+            // A transient failure can be retried only if the separate hard
+            // attempt budget still has room; the failed fetch already consumed
+            // one attempt when its batch started.
             const prevDecision = this.decisions.get(url);
             const alreadyRetried = prevDecision && prevDecision._retried;
             this.decisions.set(url, { ...decision, _retried: alreadyRetried });
@@ -479,7 +484,7 @@ class BackgroundTriageSession {
               }
             } else {
               this.blockedUrls.add(url);
-              console.log(`[BG-TRIAGE] Retry failed (${status}): ${decision.title || url}`);
+              console.log(`[BG-TRIAGE] Retry failed (${status}): ${redactSensitiveString(decision.title || url)}`);
             }
           } else {
             this.decisions.set(url, decision);
@@ -496,7 +501,7 @@ class BackgroundTriageSession {
           });
           if (this.closed) break;
         } catch (err) {
-          console.warn(`[BG-TRIAGE] Batch failed: ${err.message}`);
+          console.warn(`[BG-TRIAGE] Batch failed: ${redactSensitiveString(err.message)}`);
         }
 
         console.log(`[BG-TRIAGE] Batch done: ${batchVerified} verified, ${batchRetries.length} transient-failed, health-checked=${this.healthChecked}`);
@@ -520,21 +525,24 @@ class BackgroundTriageSession {
             console.log(`[BG-TRIAGE] Selection ready: ${this.verifiedUrls.length} verified from first pass for ${this.contentKey}`);
           }
           if (batchRetries.length > 0 && !this.closed) {
-            console.log(`[BG-TRIAGE] Retrying ${batchRetries.length} transient failures from this batch`);
-            for (const c of batchRetries) {
+            const retryBatch = this._claimAttemptBudget(batchRetries);
+            console.log(`[BG-TRIAGE] Retrying ${retryBatch.length}/${batchRetries.length} transient failures within remaining attempt budget`);
+            for (const c of retryBatch) {
               const existing = this.decisions.get(c.downloadUrl);
               if (existing) existing._retried = true;
             }
-            try {
-              await triageAndRank(batchRetries, {
-                ...this.triageOptions,
-                maxCandidates: batchRetries.length,
-                downloadConcurrency: Math.min(batchRetries.length, this.triageOptions.downloadConcurrency || 8),
-                onDecision: streamingOnDecision,
-                nzbPayloadCache: this.nzbPayloadCache,
-              });
-            } catch (err) {
-              console.warn(`[BG-TRIAGE] Retry batch failed: ${err.message}`);
+            if (retryBatch.length > 0) {
+              try {
+                await triageAndRank(retryBatch, {
+                  ...this.triageOptions,
+                  maxCandidates: retryBatch.length,
+                  downloadConcurrency: Math.min(retryBatch.length, this.triageOptions.downloadConcurrency || 8),
+                  onDecision: streamingOnDecision,
+                  nzbPayloadCache: this.nzbPayloadCache,
+                });
+              } catch (err) {
+                console.warn(`[BG-TRIAGE] Retry batch failed: ${redactSensitiveString(err.message)}`);
+              }
             }
           }
           break; // Done — we have verified NZBs, no need to expand further
@@ -554,7 +562,7 @@ class BackgroundTriageSession {
         }
       }
     } catch (err) {
-      console.error('[BG-TRIAGE] Background triage crashed:', err.message);
+      console.error('[BG-TRIAGE] Background triage crashed:', redactSensitiveString(err.message));
     }
 
     this.triageComplete = true;
@@ -565,7 +573,7 @@ class BackgroundTriageSession {
     // for the rest of the session's life is pure waste.
     this.nzbPayloadCache.clear();
 
-    console.log(`[BG-TRIAGE] Complete for ${this.contentKey}: ${this.verifiedUrls.length} verified, ${this.blockedUrls.size} blocked, ${this.healthChecked} health-checked, ${this.evaluated} total in ${this.triageElapsedMs}ms`);
+    console.log(`[BG-TRIAGE] Complete for ${this.contentKey}: ${this.verifiedUrls.length} verified, ${this.blockedUrls.size} blocked, ${this.healthChecked} health-checked, ${this.attemptsStarted} attempts in ${this.triageElapsedMs}ms`);
 
     if (this.verifiedUrls.length === 0 && !this.closed) {
       console.warn(`[BG-TRIAGE] No verified NZBs found for ${this.contentKey} after ${this.healthChecked} health checks — Smart Play will show failure video`);
@@ -616,15 +624,28 @@ class BackgroundTriageSession {
   }
 
   /**
+   * Atomically reserve the hard attempt budget for a proposed batch. Both
+   * fresh candidates and retries pass through here before any NZB download.
+   */
+  _claimAttemptBudget(candidates) {
+    const remainingBudget = Math.max(0, this.maxEvaluate - this.attemptsStarted);
+    const claimed = candidates.slice(0, remainingBudget);
+    this.attemptsStarted += claimed.length;
+    return claimed;
+  }
+
+  /**
    * Build the next batch of candidates to triage.
    * Pulls fresh candidates from allCandidates first, then retries.
    */
   _buildNextBatch(cursor, retryQueue) {
     const batch = [];
     const batchUrls = new Set();
+    const remainingBudget = Math.max(0, this.maxEvaluate - this.attemptsStarted);
+    const batchLimit = Math.min(this.batchSize, remainingBudget);
 
     // Pull fresh candidates from the pool
-    while (batch.length < this.batchSize && cursor.index < this.allCandidates.length) {
+    while (batch.length < batchLimit && cursor.index < this.allCandidates.length) {
       const candidate = this.allCandidates[cursor.index];
       cursor.index++;
 
@@ -641,7 +662,7 @@ class BackgroundTriageSession {
     }
 
     // Fill remaining slots with transient retries (mark as retried)
-    while (batch.length < this.batchSize && retryQueue.length > 0) {
+    while (batch.length < batchLimit && retryQueue.length > 0) {
       const candidate = retryQueue.shift();
       if (batchUrls.has(candidate.downloadUrl)) continue;
       // Skip if it got a permanent status since being queued

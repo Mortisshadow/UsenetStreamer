@@ -632,7 +632,7 @@
               <div class="field-grid">
                 <label class="wide-field">Ranked Rules JSON
                   <textarea name="NZB_RANKED_RULES" id="rankedRulesTextarea" class="pattern-input" rows="12" placeholder='{"rankedStreamExpressions":[{"name":"German","expression":"language(streams, &quot;German&quot;)","score":300}]}'></textarea>
-                  <span class="field-hint">Supports <code>rankedRegexPatterns</code> (score/keep/drop) and <code>rankedStreamExpressions</code>. SEL functions include <code>language</code>, <code>resolution</code>, <code>quality</code>, <code>encode</code>, <code>visualTag</code>, <code>audioTag</code>, <code>releaseGroup</code>, <code>size</code>, <code>bitrate</code>, <code>seasonPack</code>, <code>regexMatched</code>, <code>merge</code> and <code>negate</code>.</span>
+                  <span class="field-hint">Supports <code>rankedRegexPatterns</code> (score/keep/drop) and <code>rankedStreamExpressions</code>. SEL functions include <code>language</code>, <code>resolution</code>, <code>quality</code>, <code>encode</code>, <code>visualTag</code>, <code>audioTag</code>, <code>releaseGroup</code>, <code>size</code>, <code>bitrate</code>, <code>seasonPack</code>, <code>packType</code>, <code>regexMatched</code>, <code>merge</code> and <code>negate</code>.</span>
                 </label>
               </div>
               <div class="inline-actions">
@@ -703,7 +703,8 @@ health'></textarea>
                 <code>indexer</code> — indexer name<br>
                 <code>health</code> — health-check result (✅ / ❌)<br>
                 <code>instant</code> — instant-play ⚡ marker<br>
-                <code>season_pack</code> — 📦 marker for full-season or episode-range packs<br>
+                <code>season_pack</code> — 📦 descriptive marker such as Season Pack S02, Episode Pack E01–E05, or Multi-Season Pack S01–S03<br>
+                <code>pack_type</code> — machine-friendly pack type (<code>season</code>, <code>episode-range</code>, or <code>multi-season</code>) · <code>pack_range</code> — detected range<br>
                 <code>files</code> — number of files in the NZB (the video plus extras like sample, .nfo and .par2 repair files), when the indexer reports it<br>
                 <code>grabs</code> — how many times the release has been downloaded · <code>date</code> — publish date<br>
                 <code>addon</code> — addon name

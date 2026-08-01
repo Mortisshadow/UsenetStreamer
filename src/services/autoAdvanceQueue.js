@@ -19,6 +19,7 @@
 //   const nextSlot = await session.waitForReady(timeoutMs);
 
 const EventEmitter = require('events');
+const { redactSensitiveString } = require('../utils/logSanitizer');
 
 const POLL_INTERVAL_MS = 200;
 const DEFAULT_READY_TIMEOUT_MS = 240000;
@@ -141,7 +142,7 @@ class AutoAdvanceSession extends EventEmitter {
     const slot = this.slots.get(downloadUrl);
     if (slot) slot.status = 'failed';
     this.processing.delete(downloadUrl);
-    console.log(`[AUTO-ADVANCE] Marked as failed: ${downloadUrl}`);
+    console.log(`[AUTO-ADVANCE] Marked as failed: ${redactSensitiveString(downloadUrl)}`);
 
     if (activate) {
       // Activate on failure (user clicked, NZB failed, need next)
@@ -161,7 +162,7 @@ class AutoAdvanceSession extends EventEmitter {
     // Avoid duplicates
     if (this.candidates.some((c) => c.downloadUrl === candidate.downloadUrl)) return;
     this.candidates.push(candidate);
-    console.log(`[AUTO-ADVANCE] Added verified candidate: ${candidate.title || candidate.downloadUrl}`);
+    console.log(`[AUTO-ADVANCE] Added verified candidate: ${redactSensitiveString(candidate.title || candidate.downloadUrl)}`);
     if (this.activated) this._fillPipeline();
   }
 
@@ -310,7 +311,7 @@ class AutoAdvanceSession extends EventEmitter {
       if (this.closed) return;
       this.slots.set(candidate.downloadUrl, { status: 'ready', data });
       this.readyQueue.push(candidate.downloadUrl);
-      console.log(`[AUTO-ADVANCE] Slot ready: ${candidate.title || candidate.downloadUrl}`);
+      console.log(`[AUTO-ADVANCE] Slot ready: ${redactSensitiveString(candidate.title || candidate.downloadUrl)}`);
       this.emit('slot-ready', data);
       this._fillPipeline();
     }).catch((err) => {
@@ -318,7 +319,7 @@ class AutoAdvanceSession extends EventEmitter {
       if (this.closed) return;
       this.slots.set(candidate.downloadUrl, { status: 'error', error: err });
       this.failedUrls.add(candidate.downloadUrl);
-      console.warn(`[AUTO-ADVANCE] Queue failed for ${candidate.title || candidate.downloadUrl}: ${err.message}`);
+      console.warn(`[AUTO-ADVANCE] Queue failed for ${redactSensitiveString(candidate.title || candidate.downloadUrl)}: ${redactSensitiveString(err.message)}`);
       // Only keep trying to fill backup slots if no ready slot exists yet.
       // Once the primary is ready, stop cascading through failures for backup.
       if (this.activeCount === 0) {

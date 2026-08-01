@@ -66,10 +66,11 @@ const easynewsService = require('./src/services/easynews');
 const { toFiniteNumber, toPositiveInt, toBoolean, parseCommaList, parsePathList, normalizeSortMode, resolvePreferredLanguages, resolveLanguageLabel, resolveLanguageLabels, toSizeBytesFromGb, toSizeBytesFromMb, collectConfigValues, computeManifestUrl, stripTrailingSlashes, decodeBase64Value, deriveSortOrder } = require('./src/utils/config');
 const { normalizeReleaseTitle, parseRequestedEpisode, isVideoFileName, fileMatchesEpisode, normalizeNzbdavPath, inferMimeType, normalizeIndexerToken, nzbMatchesIndexer, cleanSpecialSearchTitle, parseFilterList, normalizeResolutionToken } = require('./src/utils/parsers');
 const { sanitizeErrorForClient, TRIAGE_FINAL_STATUSES, isTriageFinalStatus, buildStreamCacheKey, restoreTriageDecisions, extractTriageOverrides, sleep, annotateNzbResult, applyMaxSizeFilter, prepareSortedResults, getPreferredLanguageMatch, getPreferredLanguageMatches, triageStatusRank, buildTriageTitleMap, prioritizeTriageCandidates, triageDecisionsMatchStatuses, sanitizeDecisionForCache, serializeFinalNzbResults, restoreFinalNzbResults, safeStat, formatStreamTitle } = require('./src/utils/helpers');
+const { redactSensitiveString } = require('./src/utils/logSanitizer');
 const { maskSensitiveValues, unsentinelValues, CREDENTIAL_MASK_SENTINEL, SENSITIVE_KEYS, SENSITIVE_KEY_PATTERNS, isSensitiveKey } = require('./src/utils/credentialMask');
 const { buildTriageNntpConfig, buildNntpServersArray } = require('./src/services/triage/nntpConfig');
-const { sanitizeStrictSearchPhrase, cleanSearchTitle, matchesStrictSearch, normaliseTitle, levenshteinRatio, titleSimilarityCheck, TITLE_SIMILARITY_THRESHOLD } = require('./src/utils/stringUtils');
-const { getEpisodeMatchState, getSeasonMatchState, titleContainsSeasonPack } = require('./src/utils/episodeMatching');
+const { sanitizeStrictSearchPhrase, cleanSearchTitle, matchesStrictSearch, matchesStrictPackTitle, normaliseTitle, levenshteinRatio, titleSimilarityCheck, TITLE_SIMILARITY_THRESHOLD } = require('./src/utils/stringUtils');
+const { getEpisodeMatchState, getSeasonMatchState, classifyPackTitle } = require('./src/utils/episodeMatching');
 const { buildContentDisposition } = require('./src/utils/contentDisposition');
 const { formatResolutionBadge, extractQualityFeatureBadges, summarizeNewznabPlan } = require('./src/utils/formatters');
 const { normalizeUsenetGroup, extractUsenetGroup, extractFileCount, parseAllowedResolutionList, parseResolutionLimitValue, isResultFromPaidIndexer, dedupeResultsByTitle, DEDUPE_MODES } = require('./src/utils/resultUtils');
@@ -2599,23 +2600,55 @@ async function streamHandler(req, res) {
       if (effIncludeSeasonPacks && type === 'series' && Number.isFinite(seasonNum) && Number.isFinite(episodeNum)) {
         const episodeSuffix = /\s+s\d{1,3}e\d{1,4}\s*$/i;
         const episodePlans = searchPlans.filter((plan) => plan.type === 'search' && plan.rawQuery && episodeSuffix.test(plan.rawQuery));
+        const episodePlanBases = episodePlans
+          .map((plan) => plan.rawQuery.replace(episodeSuffix, '').trim())
+          .filter(Boolean);
         let packPlansAdded = 0;
-        const maxPackPlans = 6;
-        for (const episodePlan of episodePlans) {
-          if (packPlansAdded >= maxPackPlans) break;
-          const baseTitle = episodePlan.rawQuery.replace(episodeSuffix, '').trim();
-          if (!baseTitle) continue;
+        const maxPackPlans = 3;
+        const canonicalBase = episodePlanBases[0];
+        if (canonicalBase) {
           const paddedSeason = String(seasonNum).padStart(2, '0');
+          const canonicalKey = sanitizeStrictSearchPhrase(canonicalBase);
+          const knownTitleKeys = new Set([
+            canonicalBase,
+            ...(tmdbMetadata?.titles || []).flatMap((entry) => [entry?.title, entry?.asciiTitle]),
+          ].filter(Boolean).map((title) => sanitizeStrictSearchPhrase(title)));
+          // Alternative-title queries are primarily useful for anime (for
+          // example My Hero Academia -> Boku no Hero Academia). Keep the
+          // fixed three-query budget and avoid replacing the broad canonical
+          // query for ordinary series with an arbitrary marketing title.
+          const shouldUseAnimeAlias = isAnimeRequest || tmdbMetadata?.originalLanguage === 'ja';
+          const alternativeTitleKeys = new Set((tmdbMetadata?.alternativeTitles || [])
+            .flatMap((entry) => [entry?.title, entry?.asciiTitle])
+            .filter(Boolean)
+            .map((title) => sanitizeStrictSearchPhrase(title)));
+          const resolvedPlanAlias = shouldUseAnimeAlias
+            ? episodePlanBases.find((title) => {
+              const key = sanitizeStrictSearchPhrase(title);
+              return key !== canonicalKey && alternativeTitleKeys.has(key);
+            }) || episodePlanBases.find((title) => sanitizeStrictSearchPhrase(title) !== canonicalKey)
+            : null;
+          const tmdbAlias = shouldUseAnimeAlias ? (tmdbMetadata?.alternativeTitles || [])
+            .map((entry) => cleanSearchTitle(entry?.asciiTitle || entry?.title || ''))
+            .find((title) => {
+              if (!title || knownTitleKeys.has(sanitizeStrictSearchPhrase(title))) return false;
+              if (/\b(?:season|part|cour)\s*\d+\b|\bs\d{1,3}\b/i.test(title)) return false;
+              return (title.match(/[a-z]/gi) || []).length >= 4;
+            }) : null;
+          const aliasBase = resolvedPlanAlias || tmdbAlias;
           const packQueries = [
-            `${baseTitle} S${paddedSeason}`,
-            `${baseTitle} S${paddedSeason} Complete`,
-            `${baseTitle} Season ${seasonNum}`,
+            `${canonicalBase} S${paddedSeason} Complete`,
+            `${canonicalBase} Season ${seasonNum}`,
+            aliasBase ? `${aliasBase} Season ${seasonNum}` : `${canonicalBase} S${paddedSeason}`,
           ];
           for (const packQuery of packQueries) {
             if (packPlansAdded >= maxPackPlans) break;
             if (addPlan('search', { rawQuery: packQuery, seasonPack: true })) {
               packPlansAdded += 1;
             }
+          }
+          if (aliasBase) {
+            console.log(`${INDEXER_LOG_PREFIX} Using one resolved anime alias within fixed pack-search budget`, { alias: aliasBase });
           }
         }
         if (packPlansAdded > 0) {
@@ -2701,6 +2734,14 @@ async function streamHandler(req, res) {
       const aggregatedResults = usingStrictIdMatching ? [] : null;
       const rawAggregatedResults = [];
       const planSummaries = [];
+      const packAllowedTitles = [
+        movieTitle,
+        ...searchPlans
+          .filter((plan) => plan.type === 'search' && plan.rawQuery)
+          .map((plan) => String(plan.rawQuery).replace(/\s+s\d{1,3}(?:e\d{1,4})?(?:\s+complete)?\s*$/i, '').replace(/\s+season\s+\d{1,3}\s*$/i, '').trim()),
+        ...(tmdbMetadata?.titles || []).flatMap((entry) => [entry?.title, entry?.asciiTitle]),
+        ...(tmdbMetadata?.alternativeTitles || []).flatMap((entry) => [entry?.title, entry?.asciiTitle]),
+      ].filter(Boolean);
 
       const resultMatchesStrictPlan = (plan, item) => {
         const isTvdbPlan = Array.isArray(plan?.tokens) && plan.tokens.some(t => /^\{TvdbId:/i.test(t));
@@ -2714,6 +2755,7 @@ async function streamHandler(req, res) {
         let episodeAnnotated = null;
         let episodeMatchState = 'none';
         let isRequestedSeasonPack = false;
+        let packInfo = null;
         if (type === 'series' && Number.isFinite(seasonNum) && Number.isFinite(episodeNum)) {
           episodeAnnotated = (item?.season !== undefined || item?.episode !== undefined)
             ? item
@@ -2724,8 +2766,10 @@ async function streamHandler(req, res) {
             episodeAnnotated
           );
           const seasonMatchState = getSeasonMatchState(item?.title || item?.Title || '', seasonNum);
-          isRequestedSeasonPack = effIncludeSeasonPacks
-            && titleContainsSeasonPack(item?.title || item?.Title || '', seasonNum, episodeNum);
+          packInfo = effIncludeSeasonPacks
+            ? classifyPackTitle(item?.title || item?.Title || '', seasonNum, episodeNum)
+            : null;
+          isRequestedSeasonPack = Boolean(packInfo);
 
           // Never trust an indexer's query matching when the release itself
           // explicitly names a different season or episode.
@@ -2736,14 +2780,45 @@ async function streamHandler(req, res) {
           // the value so a stale flag from a cached/indexer object cannot turn
           // an explicit S02E07 result into a season pack.
           item.isSeasonPack = isRequestedSeasonPack;
+          item.packType = packInfo?.type || null;
+          item.packLabel = packInfo?.label || null;
+          item.packRange = packInfo?.range || null;
+          item.packStartEpisode = packInfo?.startEpisode ?? null;
+          item.packEndEpisode = packInfo?.endEpisode ?? null;
+          item.packStartSeason = packInfo?.startSeason ?? null;
+          item.packEndSeason = packInfo?.endSeason ?? null;
 
           // Treasure Maps' TVDB endpoint can return broad show-level results.
-          // Require either the exact episode or an explicitly recognised pack.
+          // Require both the requested episode/pack coverage and the exact
+          // canonical/authoritative-alias show core. This also blocks spin-off
+          // episodes such as "Vigilante - Boku no Hero Academia Illegals" even
+          // when their SxxEyy happens to equal the requested episode.
+          if (isTvdbPlan && isSceneNzbs && !matchesStrictPackTitle(
+            item?.title || item?.Title || '',
+            packAllowedTitles,
+            seasonNum,
+          )) {
+            return false;
+          }
           if (isTvdbPlan && isSceneNzbs && episodeMatchState !== 'exact' && !isRequestedSeasonPack) {
             return false;
           }
         }
         if (!plan?.strictMatch || !plan.strictPhrase) return true;
+        if (plan.seasonPack) {
+          const rawCandidateTitle = item?.title || item?.Title || '';
+          const packTitleMatches = isRequestedSeasonPack
+            && matchesStrictPackTitle(rawCandidateTitle, packAllowedTitles, seasonNum);
+          if (!packTitleMatches && isNewznabDebugEnabled()) {
+            console.log(`${INDEXER_LOG_PREFIX} Strict pack core-title match failed`, {
+              title: rawCandidateTitle,
+              expectedTitles: packAllowedTitles.slice(0, 8),
+              expectedSeason: seasonNum,
+              query: plan.query,
+            });
+          }
+          return packTitleMatches;
+        }
         const annotated = episodeAnnotated || (
           (item?.parsedTitle || item?.parsedTitleDisplay || item?.season || item?.episode || item?.year)
             ? item
@@ -2797,42 +2872,29 @@ async function streamHandler(req, res) {
           return false;
         }
         if (type === 'series' && Number.isFinite(seasonNum) && Number.isFinite(episodeNum)) {
-          if (plan.seasonPack) {
-            if (!isRequestedSeasonPack) {
-              if (isNewznabDebugEnabled()) {
-                console.log(`${INDEXER_LOG_PREFIX} Strict pack match failed`, {
-                  title: candidateTitle,
-                  expectedSeason: seasonNum,
-                  query: plan.query,
-                });
-              }
-              return false;
+          if (!Number.isFinite(annotated?.season) || !Number.isFinite(annotated?.episode)) {
+            if (isNewznabDebugEnabled()) {
+              console.log(`${INDEXER_LOG_PREFIX} Strict text match failed (missing season/episode)`, {
+                title: candidateTitle,
+                season: annotated?.season ?? null,
+                episode: annotated?.episode ?? null,
+                query: plan.query,
+              });
             }
-          } else {
-            if (!Number.isFinite(annotated?.season) || !Number.isFinite(annotated?.episode)) {
-              if (isNewznabDebugEnabled()) {
-                console.log(`${INDEXER_LOG_PREFIX} Strict text match failed (missing season/episode)`, {
-                  title: candidateTitle,
-                  season: annotated?.season ?? null,
-                  episode: annotated?.episode ?? null,
-                  query: plan.query,
-                });
-              }
-              return false;
+            return false;
+          }
+          if (Number(annotated.season) !== Number(seasonNum) || Number(annotated.episode) !== Number(episodeNum)) {
+            if (isNewznabDebugEnabled()) {
+              console.log(`${INDEXER_LOG_PREFIX} Strict text match failed (season/episode mismatch)`, {
+                title: candidateTitle,
+                season: annotated?.season ?? null,
+                episode: annotated?.episode ?? null,
+                expectedSeason: seasonNum,
+                expectedEpisode: episodeNum,
+                query: plan.query,
+              });
             }
-            if (Number(annotated.season) !== Number(seasonNum) || Number(annotated.episode) !== Number(episodeNum)) {
-              if (isNewznabDebugEnabled()) {
-                console.log(`${INDEXER_LOG_PREFIX} Strict text match failed (season/episode mismatch)`, {
-                  title: candidateTitle,
-                  season: annotated?.season ?? null,
-                  episode: annotated?.episode ?? null,
-                  expectedSeason: seasonNum,
-                  expectedEpisode: episodeNum,
-                  query: plan.query,
-                });
-              }
-              return false;
-            }
+            return false;
           }
         }
         if (type === 'movie' && Number.isFinite(releaseYear)) {
@@ -3247,6 +3309,7 @@ async function streamHandler(req, res) {
       originalLanguage: tmdbMetadata?.originalLanguage || null,
       runtimeMinutes: tmdbMetadata?.runtimeMinutes || null,
       episodesInSeason: Number(tmdbMetadata?.seasonEpisodeCounts?.[String(seasonNum)]) || null,
+      seasonEpisodeCounts: tmdbMetadata?.seasonEpisodeCounts || {},
     };
     finalNzbResults = finalNzbResults.map((result, index) => annotateNzbResult(result, index, annotateContext));
 
@@ -4035,10 +4098,11 @@ async function streamHandler(req, res) {
       const fileWithExt = hasVideoExt ? fileBase : `${fileBase}.mkv`;
       const encodedFilename = encodeURIComponent(fileWithExt);
       const streamUrl = `${addonBaseUrl}${tokenSegment}${profileSegment}/nzb/stream/${encodeStreamParams(baseParams)}/${encodedFilename}`;
+      const packLabel = result.isSeasonPack ? (result.packLabel || 'Season Pack') : '';
       const tags = [];
       if (triageTag) tags.push(triageTag);
       if (isInstant && effStreamingMode !== 'native') tags.push('⚡ Instant');
-      if (result.isSeasonPack) tags.push('📦 Season Pack');
+      if (packLabel) tags.push(`📦 ${packLabel}`);
       if (preferredLanguageLabels.length > 0) {
         preferredLanguageLabels.forEach((language) => tags.push(language));
       }
@@ -4066,6 +4130,9 @@ async function streamHandler(req, res) {
         container: result.container || releaseInfo.container || '',
         hdr: (result.hdrList || releaseInfo.hdrList || []).join(' | '),
         audio: (result.audioList || releaseInfo.audioList || []).join(' '),
+        packLabel,
+        packType: result.packType || '',
+        packRange: result.packRange || '',
       };
 
       // Add a nested `stream` context so naming templates that expect the
@@ -4103,6 +4170,9 @@ async function streamHandler(req, res) {
         cached: isInstant || Boolean(triageTag && triageTag.includes('✅')),
         instant: isInstant,
         seasonPack: Boolean(result.isSeasonPack),
+        packLabel,
+        packType: result.packType || null,
+        packRange: result.packRange || null,
         files: Number.isFinite(result.files) ? result.files : null,
         grabs: Number.isFinite(result.grabs) ? result.grabs : null,
         date: result.publishDateMs ? new Date(result.publishDateMs).toISOString().slice(0, 10) : null,
@@ -4139,8 +4209,10 @@ async function streamHandler(req, res) {
           addon: '{addon.name}',
           title: '{stream.title::exists["{stream.title}"||""]}',
           instant: '{stream.instant::istrue["⚡"||""]}',
-          season_pack: '{stream.seasonPack::istrue["📦 Season Pack"||""]}',
-          seasonpack: '{stream.seasonPack::istrue["📦 Season Pack"||""]}',
+          season_pack: '{stream.packLabel::exists["📦 {stream.packLabel}"||""]}',
+          seasonpack: '{stream.packLabel::exists["📦 {stream.packLabel}"||""]}',
+          pack_type: '{stream.packType::exists["{stream.packType}"||""]}',
+          pack_range: '{stream.packRange::exists["{stream.packRange}"||""]}',
           health: '{stream.health::exists["{stream.health}"||""]}',
           quality: '{stream.resolution::exists["{stream.resolution}"||""]}',
           resolution_quality: '{stream.resolution::exists["{stream.resolution}"||""]}',
@@ -4175,8 +4247,10 @@ async function streamHandler(req, res) {
           indexer: '{stream.indexer::exists["🔎 {stream.indexer}"||""]}',
           health: '{stream.health::exists["🧪 {stream.health}"||""]}',
           instant: '{stream.instant::istrue["⚡ Instant"||""]}',
-          season_pack: '{stream.seasonPack::istrue["📦 Season Pack"||""]}',
-          seasonpack: '{stream.seasonPack::istrue["📦 Season Pack"||""]}',
+          season_pack: '{stream.packLabel::exists["📦 {stream.packLabel}"||""]}',
+          seasonpack: '{stream.packLabel::exists["📦 {stream.packLabel}"||""]}',
+          pack_type: '{stream.packType::exists["📦 {stream.packType}"||""]}',
+          pack_range: '{stream.packRange::exists["📦 {stream.packRange}"||""]}',
           files: '{stream.files::exists["📁 {stream.files} files"||""]}',
           grabs: '{stream.grabs::exists["⬇️ {stream.grabs} grabs"||""]}',
           date: '{stream.date::exists["📅 {stream.date}"||""]}',
@@ -4218,13 +4292,13 @@ async function streamHandler(req, res) {
       };
 
       // Default stream description template
-      const defaultDescriptionPattern = '{stream.title::exists["🎬 {stream.title}\n"||""]}{stream.seasonPack::istrue["📦 Season Pack\n"||""]}{stream.source::exists["🎥 {stream.source} "||""]}{stream.encode::exists["🎞️ {stream.encode}\n"||"\n"]}{stream.visualTags::join(\' | \')::exists["📺 {stream.visualTags::join(\' | \')}\n"||""]}{stream.audioTags::join(\' \')::exists["🎧 {stream.audioTags::join(\' \')}\n"||""]}{stream.releaseGroup::exists["👥 {stream.releaseGroup}\n"||""]}{stream.size::>0["📦 {stream.size::bytes}\n"||""]}{stream.languages::join(\' \')::exists["🌎 {stream.languages::join(\' \')}\n"||""]}{stream.indexer::exists["🔎 {stream.indexer}"||""]}';
-      const effectiveDefaultDescriptionPattern = `{stream.title::exists["🎬 {stream.title}\n"||""]}{stream.seasonPack::istrue["📦 Season Pack\n"||""]}{stream.streamQuality::exists["✨ {stream.streamQuality}\n"||""]}{stream.source::exists["🎥 {stream.source}\n"||""]}{stream.encode::exists["🎞️ {stream.encode}\n"||""]}{stream.visualTags::join(" | ")::exists["📺 {stream.visualTags::join(\" | \")}\n"||""]}{stream.audioTags::join(" ")::exists["🎧 {stream.audioTags::join(\" \")}\n"||""]}{stream.releaseGroup::exists["👥 {stream.releaseGroup}\n"||""]}{stream.size::>0["📦 {stream.size::bytes}\n"||""]}{stream.languages::join(" ")::exists["🌎 {stream.languages::join(\" \")}\n"||""]}{stream.indexer::exists["🔎 {stream.indexer}\n"||""]}{stream.health::exists["🧪 {stream.health}"||""]}`;
+      const defaultDescriptionPattern = '{stream.title::exists["🎬 {stream.title}\n"||""]}{stream.packLabel::exists["📦 {stream.packLabel}\n"||""]}{stream.source::exists["🎥 {stream.source} "||""]}{stream.encode::exists["🎞️ {stream.encode}\n"||"\n"]}{stream.visualTags::join(\' | \')::exists["📺 {stream.visualTags::join(\' | \')}\n"||""]}{stream.audioTags::join(\' \')::exists["🎧 {stream.audioTags::join(\' \')}\n"||""]}{stream.releaseGroup::exists["👥 {stream.releaseGroup}\n"||""]}{stream.size::>0["📦 {stream.size::bytes}\n"||""]}{stream.languages::join(\' \')::exists["🌎 {stream.languages::join(\' \')}\n"||""]}{stream.indexer::exists["🔎 {stream.indexer}"||""]}';
+      const effectiveDefaultDescriptionPattern = `{stream.title::exists["🎬 {stream.title}\n"||""]}{stream.packLabel::exists["📦 {stream.packLabel}\n"||""]}{stream.streamQuality::exists["✨ {stream.streamQuality}\n"||""]}{stream.source::exists["🎥 {stream.source}\n"||""]}{stream.encode::exists["🎞️ {stream.encode}\n"||""]}{stream.visualTags::join(" | ")::exists["📺 {stream.visualTags::join(\" | \")}\n"||""]}{stream.audioTags::join(" ")::exists["🎧 {stream.audioTags::join(\" \")}\n"||""]}{stream.releaseGroup::exists["👥 {stream.releaseGroup}\n"||""]}{stream.size::>0["📦 {stream.size::bytes}\n"||""]}{stream.languages::join(" ")::exists["🌎 {stream.languages::join(\" \")}\n"||""]}{stream.indexer::exists["🔎 {stream.indexer}\n"||""]}{stream.health::exists["🧪 {stream.health}"||""]}`;
       const effectiveDescriptionPattern = buildPatternFromTokenList(profileEff ? profileEff.config.NZB_NAMING_PATTERN : NZB_NAMING_PATTERN, 'long', effectiveDefaultDescriptionPattern);
       const formattedTitle = formatStreamTitle(effectiveDescriptionPattern, namingContext, effectiveDefaultDescriptionPattern);
 
-      const defaultNamePattern = '{addon.name} {stream.health::exists["{stream.health} "||""]}{stream.instant::istrue["⚡ "||""]}{stream.seasonPack::istrue["📦 Pack "||""]}{stream.resolution::exists["{stream.resolution}"||""]}';
-      const effectiveDefaultNamePattern = '{addon.name} {stream.health::exists["{stream.health} "||""]}{stream.instant::istrue["⚡ "||""]}{stream.seasonPack::istrue["📦 Pack "||""]}{stream.resolution::exists["{stream.resolution}"||""]}';
+      const defaultNamePattern = '{addon.name} {stream.health::exists["{stream.health} "||""]}{stream.instant::istrue["⚡ "||""]}{stream.packLabel::exists["📦 {stream.packLabel} "||""]}{stream.resolution::exists["{stream.resolution}"||""]}';
+      const effectiveDefaultNamePattern = '{addon.name} {stream.health::exists["{stream.health} "||""]}{stream.instant::istrue["⚡ "||""]}{stream.packLabel::exists["📦 {stream.packLabel} "||""]}{stream.resolution::exists["{stream.resolution}"||""]}';
       const effectiveNamePattern = buildPatternFromTokenList(profileEff ? profileEff.config.NZB_DISPLAY_NAME_PATTERN : NZB_DISPLAY_NAME_PATTERN, 'short', effectiveDefaultNamePattern);
       const formattedName = formatStreamTitle(effectiveNamePattern, namingContext, effectiveDefaultNamePattern);
 
@@ -4329,6 +4403,9 @@ async function streamHandler(req, res) {
             indexerLanguage: sourceLanguage,
             resolution: detectedResolutionToken || null,
             seasonPack: Boolean(result.isSeasonPack),
+            packType: result.packType || null,
+            packLabel: result.packLabel || null,
+            packRange: result.packRange || null,
             estimatedEpisodeSize: result.estimatedEpisodeSize || null,
             preferredLanguageMatch: preferredLanguageHit,
             preferredLanguageName: matchedPreferredLanguage,
@@ -4573,7 +4650,7 @@ async function streamHandler(req, res) {
             smartPlayMode: SMART_PLAY_MODE,
             backupCount: effAutoAdvanceBackupCount,
             initialBatchSize: TRIAGE_MAX_CANDIDATES,
-            maxEvaluate: Math.max(12, TRIAGE_MAX_CANDIDATES * 2),
+            maxEvaluate: TRIAGE_MAX_CANDIDATES,
             historyByTitle,
             completedCandidates,
             rankByUrl: resultRankByUrl,
@@ -4741,7 +4818,7 @@ async function streamHandler(req, res) {
             try {
               const cachedEntry = diskNzbCache.getFromDisk(prefetchCandidate.downloadUrl);
               if (cachedEntry) {
-                console.log('[CACHE] Using verified NZB payload for prefetch', { downloadUrl: prefetchCandidate.downloadUrl });
+                console.log('[CACHE] Using verified NZB payload for prefetch', { downloadUrl: redactSensitiveString(prefetchCandidate.downloadUrl) });
               }
               const added = await nzbdavService.addNzbToNzbdav({
                 downloadUrl: prefetchCandidate.downloadUrl,
@@ -4911,7 +4988,7 @@ async function handleSmartPlay(req, res) {
     // stream it immediately — no history fetch, no waiting.
     const peekedSlot = bgSession.peekReady();
     if (peekedSlot && peekedSlot.viewPath) {
-      console.log(`[SMART-PLAY] Instant stream from ready slot: ${peekedSlot.title || peekedSlot.downloadUrl}`);
+      console.log(`[SMART-PLAY] Instant stream from ready slot: ${redactSensitiveString(peekedSlot.title || peekedSlot.downloadUrl)}`);
       if ((req.method || 'GET').toUpperCase() === 'HEAD') {
         const inferredMime = inferMimeType(peekedSlot.fileName || peekedSlot.title || 'stream');
         const totalSize = Number.isFinite(peekedSlot.size) ? peekedSlot.size : undefined;
@@ -5036,7 +5113,7 @@ async function handleSmartPlay(req, res) {
 
       const bestVerified = playable.bestVerified || bgSession.getBestVerified();
       if (bestVerified) {
-        console.log(`[SMART-PLAY] Top-ranked mode — queueing best verified NZB (rank=${bgSession._getRank(bestVerified.downloadUrl)}): ${bestVerified.title}`);
+        console.log(`[SMART-PLAY] Top-ranked mode — queueing best verified NZB (rank=${bgSession._getRank(bestVerified.downloadUrl)}): ${redactSensitiveString(bestVerified.title || bestVerified.downloadUrl)}`);
         if (bgSession.autoAdvanceSession) {
           bgSession.autoAdvanceSession.prioritizeCandidate(bestVerified.downloadUrl);
           if (!bgSession.autoAdvanceSession.activated) {
@@ -5076,7 +5153,7 @@ async function handleSmartPlay(req, res) {
       return;
     }
 
-    console.log(`[SMART-PLAY] Ready slot found: ${readySlot.title || readySlot.downloadUrl}`);
+    console.log(`[SMART-PLAY] Ready slot found: ${redactSensitiveString(readySlot.title || readySlot.downloadUrl)}`);
 
     // Stream the ready slot's video
     if ((req.method || 'GET').toUpperCase() === 'HEAD') {
@@ -5114,7 +5191,7 @@ async function handleSmartPlay(req, res) {
 
         try {
           const nextSlot = await bgSession.waitForReady(60000);
-          console.log(`[SMART-PLAY] Auto-advance slot: ${nextSlot.title || nextSlot.downloadUrl}`);
+          console.log(`[SMART-PLAY] Auto-advance slot: ${redactSensitiveString(nextSlot.title || nextSlot.downloadUrl)}`);
           if (!res.headersSent) {
             await nzbdavService.proxyNzbdavStream(req, res, nextSlot.viewPath, nextSlot.fileName || '');
           }
@@ -5232,7 +5309,7 @@ async function handleNzbdavStream(req, res) {
         const prefetchFailError = new Error(`[NZBDAV] NZB previously failed: ${prefetchedSlotHint.failureMessage || 'unknown'}`);
         prefetchFailError.isNzbdavFailure = true;
         prefetchFailError.failureMessage = prefetchedSlotHint.failureMessage;
-        console.log(`[PREFETCH] Skipping known-failed NZB, going directly to auto-advance: ${downloadUrl}`);
+        console.log(`[PREFETCH] Skipping known-failed NZB, going directly to auto-advance: ${redactSensitiveString(downloadUrl)}`);
         throw prefetchFailError;
       }
       if (prefetchedSlotHint?.nzoId) {
@@ -5335,7 +5412,7 @@ async function handleNzbdavStream(req, res) {
         activeSession.markFailed(downloadUrl);
         try {
           const autoAdvanceSlot = await activeSession.waitForReady(60000);
-          console.log(`[AUTO-ADVANCE] Using auto-advance: ${autoAdvanceSlot.title || autoAdvanceSlot.downloadUrl}`);
+          console.log(`[AUTO-ADVANCE] Using auto-advance: ${redactSensitiveString(autoAdvanceSlot.title || autoAdvanceSlot.downloadUrl)}`);
 
           // If the slot was marked externally ready (e.g. by prefetch), it only has
           // { downloadUrl, external: true } — resolve the actual viewPath/file info

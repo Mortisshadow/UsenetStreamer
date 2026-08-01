@@ -5,6 +5,7 @@ const {
   extractSeasonEpisodeRanges,
   getEpisodeMatchState,
   getSeasonMatchState,
+  classifyPackTitle,
   titleContainsSeasonPack,
 } = require('../src/utils/episodeMatching');
 const { fileMatchesEpisode } = require('../src/utils/parsers');
@@ -89,4 +90,19 @@ test('recognises requested season packs and rejects wrong-season packs', () => {
 test('episode range match is exact only when it covers the requested episode', () => {
   assert.equal(getEpisodeMatchState('Show.S02E01-E25.1080p', requested), 'exact');
   assert.equal(getEpisodeMatchState('Show.S02E06-E25.1080p', requested), 'mismatch');
+});
+
+test('classifies season, episode-range, and multi-season packs separately', () => {
+  assert.deepEqual(classifyPackTitle('Mob Psycho 100 Season 2 episode 1 - 5', 2, 5), {
+    type: 'episode-range',
+    label: 'Episode Pack E01–E05',
+    range: 'E01–E05',
+    season: 2,
+    startEpisode: 1,
+    endEpisode: 5,
+  });
+  assert.equal(classifyPackTitle('[Breeze] Mob Psycho 100 Season 2 [1080p]', 2, 5).type, 'season');
+  assert.equal(classifyPackTitle('Mob.Psycho.100.II.S02.2019.COMPLETE.German.1080p', 2, 5).type, 'season');
+  assert.equal(classifyPackTitle('Mob.Psycho.100.II.S02.OVA.2019.COMPLETE.German.1080p', 2, 5), null);
+  assert.equal(classifyPackTitle('Show S01-S03 Complete', 2, 5).type, 'multi-season');
 });

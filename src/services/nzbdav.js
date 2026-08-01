@@ -11,6 +11,7 @@ const { pipeline } = require('stream');
 const cache = require('../cache');
 const diskNzbCache = require('../cache/diskNzbCache');
 const { normalizeReleaseTitle, normalizeNzbdavPath, isVideoFileName, fileMatchesEpisode, inferMimeType } = require('../utils/parsers');
+const { redactSensitiveString } = require('../utils/logSanitizer');
 const { sleep, safeStat } = require('../utils/helpers');
 const { getDefaultDownloadUserAgent } = require('../utils/userAgent');
 const { getDownloadUserAgentForIndexer, getProxyForIndexer } = require('./newznab');
@@ -639,7 +640,7 @@ async function buildNzbdavStream({ downloadUrl, category, title, requestedEpisod
       } else {
         const cachedNzbEntry = inlineCachedEntry || diskNzbCache.getFromDisk(downloadUrl);
         if (cachedNzbEntry) {
-          console.log('[CACHE] Using verified NZB payload', { downloadUrl, source: inlineCachedEntry ? 'inline' : 'disk' });
+          console.log('[CACHE] Using verified NZB payload', { downloadUrl: redactSensitiveString(downloadUrl), source: inlineCachedEntry ? 'inline' : 'disk' });
         }
         const added = await addNzbToNzbdav({
           downloadUrl,

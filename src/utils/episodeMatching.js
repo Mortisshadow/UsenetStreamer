@@ -137,8 +137,10 @@ function extractSeasonTokens(title) {
   return [...seasons].filter(Number.isFinite);
 }
 
-function rangeContainsSeason(title, requestedSeason) {
+function extractSeasonRanges(title) {
   const raw = String(title || '');
+  const ranges = [];
+  const seen = new Set();
   const rangePatterns = [
     /(?:^|[^a-z0-9])s(\d{1,3})[\s._-]*(?:to|through|-)[\s._-]*s?(\d{1,3})(?![a-z0-9])/gi,
     /\bseasons?[\s._-]*(\d{1,3})[\s._-]*(?:to|through|-)[\s._-]*(\d{1,3})\b/gi,
@@ -147,12 +149,21 @@ function rangeContainsSeason(title, requestedSeason) {
     for (const match of raw.matchAll(pattern)) {
       const start = Number(match[1]);
       const end = Number(match[2]);
-      if (Math.min(start, end) <= requestedSeason && requestedSeason <= Math.max(start, end)) {
-        return true;
-      }
+      if (!Number.isFinite(start) || !Number.isFinite(end) || start === end) continue;
+      const normalized = { startSeason: Math.min(start, end), endSeason: Math.max(start, end) };
+      const key = `${normalized.startSeason}:${normalized.endSeason}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      ranges.push(normalized);
     }
   }
-  return false;
+  return ranges;
+}
+
+function rangeContainsSeason(title, requestedSeason) {
+  return extractSeasonRanges(title).some((range) => (
+    range.startSeason <= requestedSeason && requestedSeason <= range.endSeason
+  ));
 }
 
 function getSeasonMatchState(title, requestedSeason) {
@@ -165,37 +176,79 @@ function getSeasonMatchState(title, requestedSeason) {
   return seasonTokens.includes(season) ? 'exact' : 'mismatch';
 }
 
-function titleContainsSeasonPack(title, requestedSeason, requestedEpisode = null) {
+function classifyPackTitle(title, requestedSeason, requestedEpisode = null) {
   const season = Number(requestedSeason);
-  if (!Number.isFinite(season)) return false;
+  if (!Number.isFinite(season)) return null;
   const raw = String(title || '');
 
   const episode = Number(requestedEpisode);
   const episodeRanges = extractSeasonEpisodeRanges(raw);
-  if (episodeRanges.length > 0) {
-    return episodeRanges.some((range) => range.season === season
+  const matchingEpisodeRange = episodeRanges.find((range) => range.season === season
       && (!Number.isFinite(episode)
         || (episode >= range.startEpisode && episode <= range.endEpisode)));
+  if (matchingEpisodeRange) {
+    const start = String(matchingEpisodeRange.startEpisode).padStart(2, '0');
+    const end = String(matchingEpisodeRange.endEpisode).padStart(2, '0');
+    return {
+      type: 'episode-range',
+      label: `Episode Pack E${start}–E${end}`,
+      range: `E${start}–E${end}`,
+      season,
+      startEpisode: matchingEpisodeRange.startEpisode,
+      endEpisode: matchingEpisodeRange.endEpisode,
+    };
   }
 
   // A release carrying an episode marker is an episode/multi-episode release,
   // not a season pack. It must go through exact episode validation instead.
-  if (extractSeasonEpisodePairs(raw).length > 0) return false;
-  if (rangeContainsSeason(raw, season)) return true;
+  if (extractSeasonEpisodePairs(raw).length > 0) return null;
+
+  // A season token used as an OVA/OAD/ONA volume label is not evidence of a
+  // full season. This exact form appeared in real indexer output as S02.OVA.
+  if (/(?:^|[^a-z0-9])(?:s\d{1,3}|season[\s._-]*\d{1,3})[\s._-]*(?:ova|oad|ona)\b/i.test(raw)) {
+    return null;
+  }
+
+  const matchingSeasonRange = extractSeasonRanges(raw).find((range) => (
+    range.startSeason <= season && season <= range.endSeason
+  ));
+  if (matchingSeasonRange) {
+    const start = String(matchingSeasonRange.startSeason).padStart(2, '0');
+    const end = String(matchingSeasonRange.endSeason).padStart(2, '0');
+    return {
+      type: 'multi-season',
+      label: `Multi-Season Pack S${start}–S${end}`,
+      range: `S${start}–S${end}`,
+      season,
+      startSeason: matchingSeasonRange.startSeason,
+      endSeason: matchingSeasonRange.endSeason,
+    };
+  }
 
   const seasonTokens = extractSeasonTokens(raw);
-  if (seasonTokens.includes(season)) return true;
+  if (seasonTokens.includes(season)) {
+    const paddedSeason = String(season).padStart(2, '0');
+    return { type: 'season', label: `Season Pack S${paddedSeason}`, range: `S${paddedSeason}`, season };
+  }
 
   // "Complete Series"-style packs without explicit season tokens cover the
   // requested season. If another explicit season is present, do not let the
   // generic keyword override that contradiction.
   const completeSeries = /\b(complete[\s._-]*(?:series|collection|seasons?)|all[\s._-]*seasons|full[\s._-]*series|box[\s._-]*set|anthology)\b/i.test(raw);
-  return completeSeries && seasonTokens.length === 0;
+  return completeSeries && seasonTokens.length === 0
+    ? { type: 'multi-season', label: 'Complete Series Pack', range: 'Complete Series', season }
+    : null;
+}
+
+function titleContainsSeasonPack(title, requestedSeason, requestedEpisode = null) {
+  return Boolean(classifyPackTitle(title, requestedSeason, requestedEpisode));
 }
 
 module.exports = {
   extractSeasonEpisodePairs,
   extractSeasonEpisodeRanges,
+  extractSeasonRanges,
+  classifyPackTitle,
   getEpisodeMatchState,
   getEpisodeFileMatchState,
   getSeasonMatchState,

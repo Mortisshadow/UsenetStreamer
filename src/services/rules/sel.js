@@ -7,7 +7,7 @@
 const ALLOWED_ATTRIBUTES = new Set([
   'resolution', 'codec', 'releaseGroup', 'visualTag', 'audioTag', 'videoTag',
   'edition', 'language', 'size', 'title', 'filename', 'indexer', 'age',
-  'seeders', 'bitrate', 'seasonPack',
+  'seeders', 'bitrate', 'seasonPack', 'packType',
 ]);
 const MAX_EXPRESSION_LENGTH = 8192;
 const MAX_STRING_LENGTH = 1024;

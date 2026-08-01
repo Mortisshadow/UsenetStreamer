@@ -3,6 +3,7 @@ const { parseStringPromise: parseXmlString } = require('xml2js');
 const { stripTrailingSlashes } = require('../utils/config');
 const { getDefaultSearchUserAgent, getDefaultDownloadUserAgent } = require('../utils/userAgent');
 const { buildProxyAgents } = require('../utils/proxyAgent');
+const { redactSensitiveString } = require('../utils/logSanitizer');
 
 const MAX_NEWZNAB_INDEXERS = 20;
 const NEWZNAB_FIELD_SUFFIXES = ['ENDPOINT', 'API_KEY', 'API_PATH', 'NAME', 'INDEXER_ENABLED', 'PAID', 'PAID_LIMIT', 'ZYCLOPS', 'SEARCH_UA', 'DOWNLOAD_UA', 'PROXY'];
@@ -892,11 +893,11 @@ async function fetchIndexerResults(config, plan, options) {
       planType: plan?.type,
       query: plan?.query,
       tokens: tokenSummary,
-      url: requestUrl,
+      url: redactSensitiveString(requestUrl),
     });
   }
   if (options.debug) {
-    console.log(`${logPrefix}[SEARCH][REQ]`, { url: requestUrl, params: safeParams });
+    console.log(`${logPrefix}[SEARCH][REQ]`, { url: redactSensitiveString(requestUrl), params: safeParams });
   }
 
   const response = await axios.get(requestUrl, {
@@ -916,10 +917,10 @@ async function fetchIndexerResults(config, plan, options) {
 
   if (options.debug) {
     console.log(`${logPrefix}[SEARCH][RESP]`, {
-      url: requestUrl,
+      url: redactSensitiveString(requestUrl),
       status: response.status,
       contentType,
-      body: body?.slice(0, DEBUG_BODY_CHAR_LIMIT),
+      body: redactSensitiveString(body?.slice(0, DEBUG_BODY_CHAR_LIMIT)),
     });
   }
 
@@ -1073,7 +1074,7 @@ async function testNewznabCaps(config, options = {}) {
   const debugEnabled = Boolean(options.debug);
   const logPrefix = options.label || NEWZNAB_TEST_LOG_PREFIX;
   if (debugEnabled) {
-    console.log(`${logPrefix}[REQ]`, { url: requestUrl, params: { ...params, apikey: maskApiKey(params.apikey) } });
+    console.log(`${logPrefix}[REQ]`, { url: redactSensitiveString(requestUrl), params: { ...params, apikey: maskApiKey(params.apikey) } });
   }
 
   const response = await axios.get(requestUrl, {
@@ -1088,10 +1089,10 @@ async function testNewznabCaps(config, options = {}) {
   const body = typeof response.data === 'string' ? response.data : JSON.stringify(response.data);
   if (debugEnabled) {
     console.log(`${logPrefix}[RESP]`, {
-      url: requestUrl,
+      url: redactSensitiveString(requestUrl),
       status: response.status,
       contentType,
-      body: body?.slice(0, DEBUG_BODY_CHAR_LIMIT),
+      body: redactSensitiveString(body?.slice(0, DEBUG_BODY_CHAR_LIMIT)),
     });
   }
   if (response.status === 401 || response.status === 403) {
