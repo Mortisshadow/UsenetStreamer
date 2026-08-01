@@ -38,6 +38,9 @@ test('extracts batch episode ranges used by season and cour packs', () => {
   assert.deepEqual(extractSeasonEpisodeRanges('Show Season 2 Episodes 1-25'), [
     { season: 2, startEpisode: 1, endEpisode: 25 },
   ]);
+  assert.deepEqual(extractSeasonEpisodeRanges('[Erai-raws] Show S2 - 00~25 [720p]'), [
+    { season: 2, startEpisode: 0, endEpisode: 25 },
+  ]);
 });
 
 test('rejects explicit wrong seasons and episodes', () => {

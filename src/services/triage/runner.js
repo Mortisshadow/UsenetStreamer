@@ -214,14 +214,6 @@ async function triageAndRank(nzbResults, options = {}) {
   });
 
   const selectedCandidates = uniqueCandidates.slice(0, Math.min(maxCandidates, uniqueCandidates.length));
-  const maxSeasonPackCandidates = Math.max(0, Number(options.maxSeasonPackCandidates ?? 0));
-  if (maxSeasonPackCandidates > 0) {
-    const alreadySelectedUrls = new Set(selectedCandidates.map((candidate) => candidate.downloadUrl));
-    const extraPacks = uniqueCandidates
-      .filter((candidate) => candidate.result?.isSeasonPack === true && !alreadySelectedUrls.has(candidate.downloadUrl))
-      .slice(0, maxSeasonPackCandidates);
-    selectedCandidates.push(...extraPacks);
-  }
   if (selectedCandidates.length === 0) {
     return {
       decisions: new Map(),

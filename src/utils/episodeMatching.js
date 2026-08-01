@@ -58,7 +58,7 @@ function extractSeasonEpisodeRanges(title) {
     const endS = Number(endSeason);
     const a = Number(startEpisode);
     const b = Number(endEpisode);
-    if (![s, endS, a, b].every(Number.isFinite) || s !== endS || a <= 0 || b <= 0 || a === b) return;
+    if (![s, endS, a, b].every(Number.isFinite) || s !== endS || a < 0 || b < 0 || a === b) return;
     const start = Math.min(a, b);
     const end = Math.max(a, b);
     const key = `${s}:${start}-${end}`;
@@ -74,6 +74,11 @@ function extractSeasonEpisodeRanges(title) {
 
   // S02 Episodes 01-25 / Season 2 Ep 1 through 25.
   for (const match of raw.matchAll(/(?:^|[^a-z0-9])(?:s|season[\s._-]*)(\d{1,3})[\s._-]*(?:episodes?|eps?)[\s._-]*(\d{1,4})[\s._-]*(?:to|through|[-–—])[\s._-]*(\d{1,4})(?!\d)/gi)) {
+    add(match[1], match[2], match[3]);
+  }
+
+  // Anime batches often use a tilde and omit E: S2 - 00~25.
+  for (const match of raw.matchAll(/(?:^|[^a-z0-9])s(\d{1,3})[\s._–—-]+(\d{1,3})\s*~\s*(\d{1,3})(?!\d)/gi)) {
     add(match[1], match[2], match[3]);
   }
 

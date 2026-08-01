@@ -2609,7 +2609,7 @@ async function streamHandler(req, res) {
           const packQueries = [
             `${baseTitle} S${paddedSeason}`,
             `${baseTitle} S${paddedSeason} Complete`,
-            `${baseTitle} Season ${seasonNum} Complete`,
+            `${baseTitle} Season ${seasonNum}`,
           ];
           for (const packQuery of packQueries) {
             if (packPlansAdded >= maxPackPlans) break;
@@ -3607,24 +3607,6 @@ async function streamHandler(req, res) {
         getIndexerKey,
       });
     }
-    // The normal top-N health candidates are usually single episodes. Keep one
-    // pack candidate beyond that cap so manifest coverage is actually checked
-    // instead of merely implemented downstream but never reached.
-    if (requestedEpisode) {
-      const selectedUrls = new Set(triageEligibleResults.map((candidate) => candidate.downloadUrl));
-      const packCandidate = triagePool.find((candidate) => {
-        if (candidate?.isSeasonPack !== true || selectedUrls.has(candidate.downloadUrl)) return false;
-        const existingDecision = triageDecisions.get(candidate.downloadUrl);
-        return !existingDecision?.episodeCoverage;
-      });
-      if (packCandidate) {
-        triageEligibleResults.push(packCandidate);
-        console.log('[NZB TRIAGE] Reserved episode-aware health slot for pack', {
-          title: packCandidate.title,
-          requestedEpisode,
-        });
-      }
-    }
     const candidateHasConclusiveDecision = (candidate) => {
       const decision = triageDecisions.get(candidate.downloadUrl);
       if (decision && isTriageFinalStatus(decision.status)) {
@@ -3673,7 +3655,6 @@ async function streamHandler(req, res) {
           serializedIndexerIds: serializedIndexerTokens,
           timeBudgetMs: TRIAGE_TIME_BUDGET_MS,
           maxCandidates: TRIAGE_MAX_CANDIDATES,
-          maxSeasonPackCandidates: 1,
           requestedEpisode,
           downloadConcurrency: Math.max(1, Math.min(TRIAGE_DOWNLOAD_CONCURRENCY, TRIAGE_MAX_CANDIDATES)),
           triageOptions: {
@@ -4552,7 +4533,6 @@ async function streamHandler(req, res) {
             serializedIndexerIds: serializedIndexerTokens,
             timeBudgetMs: TRIAGE_TIME_BUDGET_MS,
             maxCandidates: TRIAGE_MAX_CANDIDATES,
-            maxSeasonPackCandidates: 1,
             requestedEpisode,
             downloadConcurrency: Math.max(1, Math.min(TRIAGE_DOWNLOAD_CONCURRENCY, TRIAGE_MAX_CANDIDATES)),
             triageOptions: {
