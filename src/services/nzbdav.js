@@ -604,7 +604,14 @@ async function findBestVideoFile({ category, jobName, requestedEpisode }) {
     }
   }
 
-  return bestEpisodeMatch || bestMatch;
+  if (!requestedEpisode) return bestMatch;
+  if (bestEpisodeMatch) return bestEpisodeMatch;
+
+  // A single-episode NZB sometimes contains a generically named video file.
+  // Falling back to that file is safe only when the NZB/job name itself names
+  // the requested episode. A season pack must never fall back to its largest
+  // file, which could silently play a different episode.
+  return fileMatchesEpisode(jobName, requestedEpisode) ? bestMatch : null;
 }
 
 async function buildNzbdavStream({ downloadUrl, category, title, requestedEpisode, existingSlot = null, inlineCachedEntry = null, indexerId = null }) {
@@ -658,10 +665,13 @@ async function buildNzbdavStream({ downloadUrl, category, title, requestedEpisod
       });
 
       if (!bestFile) {
-        const noVideoError = new Error('[NZBDAV] No playable video files found after mounting NZB');
-        noVideoError.code = 'NO_VIDEO_FILES';
+        const noVideoMessage = requestedEpisode
+          ? `Requested episode S${String(requestedEpisode.season).padStart(2, '0')}E${String(requestedEpisode.episode).padStart(2, '0')} was not found in the mounted NZB`
+          : 'No playable video files found after mounting NZB';
+        const noVideoError = new Error(`[NZBDAV] ${noVideoMessage}`);
+        noVideoError.code = requestedEpisode ? 'EPISODE_NOT_FOUND' : 'NO_VIDEO_FILES';
         noVideoError.isNzbdavFailure = true;
-        noVideoError.failureMessage = 'No playable video files found after mounting NZB';
+        noVideoError.failureMessage = noVideoMessage;
         throw noVideoError;
       }
 

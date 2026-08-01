@@ -65,8 +65,15 @@ function annotateNzbResult(result, sortIndex = 0, context = {}) {
   let derivedBitrate = null;
   const runtimeMinutes = context && Number.isFinite(context.runtimeMinutes) ? context.runtimeMinutes : null;
   const sizeBytes = Number.isFinite(result.size) ? result.size : null;
-  if (runtimeMinutes && runtimeMinutes > 0 && sizeBytes && sizeBytes > 0) {
-    derivedBitrate = Math.round((sizeBytes * 8) / (runtimeMinutes * 60));
+  const episodesInSeason = context && Number.isFinite(context.episodesInSeason) && context.episodesInSeason > 0
+    ? context.episodesInSeason
+    : null;
+  const estimatedEpisodeSize = result.isSeasonPack && sizeBytes && episodesInSeason
+    ? Math.round(sizeBytes / episodesInSeason)
+    : null;
+  const bitrateSizeBytes = estimatedEpisodeSize || sizeBytes;
+  if (runtimeMinutes && runtimeMinutes > 0 && bitrateSizeBytes && bitrateSizeBytes > 0) {
+    derivedBitrate = Math.round((bitrateSizeBytes * 8) / (runtimeMinutes * 60));
   }
 
   const annotated = {
@@ -80,6 +87,9 @@ function annotateNzbResult(result, sortIndex = 0, context = {}) {
   if (derivedBitrate !== null) {
     annotated.bitrate = derivedBitrate;
   }
+  if (estimatedEpisodeSize !== null) {
+    annotated.estimatedEpisodeSize = estimatedEpisodeSize;
+  }
   if (primaryLanguage) {
     annotated.language = primaryLanguage;
   }
@@ -91,7 +101,7 @@ function applyMaxSizeFilter(results, maxSizeBytes) {
     return results;
   }
   return results.filter((result) => {
-    const size = result?.size;
+    const size = Number.isFinite(result?.estimatedEpisodeSize) ? result.estimatedEpisodeSize : result?.size;
     return !Number.isFinite(size) || size <= maxSizeBytes;
   });
 }

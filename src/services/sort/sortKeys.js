@@ -287,6 +287,7 @@ function getStreamBitrate(stream) {
 
 function getStreamSize(stream) {
   if (!stream) return 0;
+  if (Number.isFinite(stream.estimatedEpisodeSize)) return stream.estimatedEpisodeSize;
   return Number.isFinite(stream.size) ? stream.size : 0;
 }
 

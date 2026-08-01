@@ -1,6 +1,7 @@
 // Parsing utilities for releases, episodes, and titles
 const path = require('path');
 const { VIDEO_EXTENSIONS } = require('../config/constants');
+const { getEpisodeMatchState } = require('./episodeMatching');
 
 const posixPath = path.posix;
 
@@ -59,14 +60,7 @@ function fileMatchesEpisode(fileName, requestedEpisode) {
     return true;
   }
   if (!fileName) return false;
-  const lower = fileName.toLowerCase();
-  const s = requestedEpisode.season;
-  const e = requestedEpisode.episode;
-  const patterns = [
-    `s${String(s).padStart(2, '0')}e${String(e).padStart(2, '0')}`,
-    `${s}x${String(e).padStart(2, '0')}`,
-  ];
-  return patterns.some((pattern) => lower.includes(pattern));
+  return getEpisodeMatchState(fileName, requestedEpisode) === 'exact';
 }
 
 function normalizeNzbdavPath(pathValue) {

@@ -325,6 +325,11 @@ async function getDetails(tmdbId, mediaType, language) {
       originalLanguage: data.original_language,
       releaseYear: (data.release_date || data.first_air_date || '').substring(0, 4),
       runtimeMinutes,
+      seasonEpisodeCounts: Array.isArray(data.seasons)
+        ? Object.fromEntries(data.seasons
+          .filter((season) => Number.isFinite(season?.season_number) && Number.isFinite(season?.episode_count) && season.episode_count > 0)
+          .map((season) => [String(season.season_number), season.episode_count]))
+        : {},
       alternativeTitles: [],
       translations: [],
     };
@@ -519,6 +524,7 @@ async function getMetadataAndTitles({ imdbId, tmdbId, type }) {
   let originalLanguage = null;
   let releaseYear = null;
   let runtimeMinutes = null;
+  let seasonEpisodeCounts = {};
 
   if (usingImdb && !resolvedTmdbId) {
     // Step 1: Find TMDb ID from IMDb ID
@@ -546,6 +552,7 @@ async function getMetadataAndTitles({ imdbId, tmdbId, type }) {
     originalLanguage = details.originalLanguage || 'en';
     releaseYear = details.releaseYear || null;
     runtimeMinutes = details.runtimeMinutes ?? null;
+    seasonEpisodeCounts = details.seasonEpisodeCounts || {};
     console.log(`[TMDB] Using TMDb ID ${resolvedTmdbId} (${mediaType}), original: "${originalTitle}" [${originalLanguage}], year: ${releaseYear}`);
   }
 
@@ -557,6 +564,9 @@ async function getMetadataAndTitles({ imdbId, tmdbId, type }) {
       const details = await getDetails(resolvedTmdbId, mediaType, 'en-US');
       if (details && Number.isFinite(details.runtimeMinutes)) {
         runtimeMinutes = details.runtimeMinutes;
+      }
+      if (details?.seasonEpisodeCounts) {
+        seasonEpisodeCounts = details.seasonEpisodeCounts;
       }
     } catch (error) {
       console.warn(`[TMDB] Runtime backfill failed for ${resolvedTmdbId}:`, error.message);
@@ -663,6 +673,7 @@ async function getMetadataAndTitles({ imdbId, tmdbId, type }) {
     originalLanguage,
     year: releaseYear,
     runtimeMinutes,
+    seasonEpisodeCounts,
     titles,
   };
 }

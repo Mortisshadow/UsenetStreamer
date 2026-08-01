@@ -69,6 +69,7 @@ const { sanitizeErrorForClient, TRIAGE_FINAL_STATUSES, isTriageFinalStatus, buil
 const { maskSensitiveValues, unsentinelValues, CREDENTIAL_MASK_SENTINEL, SENSITIVE_KEYS, SENSITIVE_KEY_PATTERNS, isSensitiveKey } = require('./src/utils/credentialMask');
 const { buildTriageNntpConfig, buildNntpServersArray } = require('./src/services/triage/nntpConfig');
 const { sanitizeStrictSearchPhrase, cleanSearchTitle, matchesStrictSearch, normaliseTitle, levenshteinRatio, titleSimilarityCheck, TITLE_SIMILARITY_THRESHOLD } = require('./src/utils/stringUtils');
+const { getEpisodeMatchState, getSeasonMatchState, titleContainsSeasonPack } = require('./src/utils/episodeMatching');
 const { buildContentDisposition } = require('./src/utils/contentDisposition');
 const { formatResolutionBadge, extractQualityFeatureBadges, summarizeNewznabPlan } = require('./src/utils/formatters');
 const { normalizeUsenetGroup, extractUsenetGroup, extractFileCount, parseAllowedResolutionList, parseResolutionLimitValue, isResultFromPaidIndexer, dedupeResultsByTitle, DEDUPE_MODES } = require('./src/utils/resultUtils');
@@ -1585,6 +1586,11 @@ async function streamHandler(req, res) {
   // nzbdav-only feature guards below. getEffectiveConfig already resolved the profile's
   // mode (or inherited the default).
   const effStreamingMode = profileEff ? profileEff.config.STREAMING_MODE : STREAMING_MODE;
+  // Season packs require NZBDav so the addon can select the requested file
+  // inside the mounted NZB. Native mode hands the whole NZB to Stremio and
+  // therefore cannot guarantee which episode is played.
+  const effIncludeSeasonPacks = effStreamingMode !== 'native'
+    && toBoolean(sortSource.NZB_INCLUDE_SEASON_PACKS, true);
   // A native profile on a plain-HTTP addon must be newznab-only (direct indexer HTTPS
   // links — manager links are usually local/HTTP and unplayable). On HTTPS, native serves
   // via the /nzb/fetch proxy so the manager is fine. nzbdav profiles + the default are
@@ -2189,7 +2195,7 @@ async function streamHandler(req, res) {
     if (!usingCachedSearchResults) {
       const searchPlans = [];
       const seenPlans = new Set();
-      const addPlan = (planType, { tokens = [], rawQuery = null, skipHydra = false } = {}) => {
+      const addPlan = (planType, { tokens = [], rawQuery = null, skipHydra = false, seasonPack = false } = {}) => {
         // Word-boundary normalization for the text query (q=): slash/backslash in
         // a title (e.g. "A/B") aren't word boundaries to indexers, so the
         // literal query misses dotted release names. Treat them as spaces — the
@@ -2214,7 +2220,7 @@ async function streamHandler(req, res) {
           return false;
         }
         seenPlans.add(planKey);
-        const planRecord = { type: planType, query, rawQuery: rawQuery ? rawQuery : null, tokens: normalizedTokens, skipHydra: Boolean(skipHydra) };
+        const planRecord = { type: planType, query, rawQuery: rawQuery ? rawQuery : null, tokens: normalizedTokens, skipHydra: Boolean(skipHydra), seasonPack: Boolean(seasonPack) };
         if (strictTextMode && planType === 'search' && rawQuery && !isSpecialRequest) {
           const strictPhrase = sanitizeStrictSearchPhrase(rawQuery);
           if (strictPhrase) {
@@ -2543,6 +2549,28 @@ async function streamHandler(req, res) {
         console.log(`${INDEXER_LOG_PREFIX} ${reason}; skipping text-based search`);
       }
 
+      // Reuse every validated/localised episode text plan as a season-pack
+      // plan. This covers canonical, TMDb-localised and anime aliases without
+      // duplicating the title-resolution logic above. Pack searches are text
+      // searches by nature; the post-filter below only keeps packs that cover
+      // the requested season and match the requested show title.
+      if (effIncludeSeasonPacks && type === 'series' && Number.isFinite(seasonNum) && Number.isFinite(episodeNum)) {
+        const episodeSuffix = /\s+s\d{1,3}e\d{1,4}\s*$/i;
+        const episodePlans = searchPlans.filter((plan) => plan.type === 'search' && plan.rawQuery && episodeSuffix.test(plan.rawQuery));
+        let packPlansAdded = 0;
+        for (const episodePlan of episodePlans) {
+          const baseTitle = episodePlan.rawQuery.replace(episodeSuffix, '').trim();
+          if (!baseTitle) continue;
+          const packQuery = `${baseTitle} S${String(seasonNum).padStart(2, '0')}`;
+          if (addPlan('search', { rawQuery: packQuery, seasonPack: true })) {
+            packPlansAdded += 1;
+          }
+        }
+        if (packPlansAdded > 0) {
+          console.log(`${INDEXER_LOG_PREFIX} Added ${packPlansAdded} season-pack search plan(s) for S${String(seasonNum).padStart(2, '0')}`);
+        }
+      }
+
       if (INDEXER_MANAGER_INDEXERS) {
         console.log(`${INDEXER_LOG_PREFIX} Using configured indexers`, INDEXER_MANAGER_INDEXERS);
       } else {
@@ -2626,16 +2654,48 @@ async function streamHandler(req, res) {
         const isTvdbPlan = Array.isArray(plan?.tokens) && plan.tokens.some(t => /^\{TvdbId:/i.test(t));
         // SceneNZBs rebranded to Treasure-Maps — match either name (some users
         // still carry the old display name, new adds use the new one).
-        const idxName = String(item?.indexerId || item?.indexer || '').toLowerCase();
+        const idxName = [item?.indexerId, item?.indexer, item?.indexerName]
+          .filter((value) => value !== undefined && value !== null && String(value).trim())
+          .map((value) => String(value).toLowerCase())
+          .join(' ');
         const isSceneNzbs = idxName.includes('scenenzbs') || /treasure[\s-]?maps/.test(idxName);
-        if (isTvdbPlan && isSceneNzbs && type === 'series' && Number.isFinite(seasonNum) && Number.isFinite(episodeNum)) {
-          const annotated = (item?.season !== undefined || item?.episode !== undefined) ? item : annotateNzbResult(item, 0);
-          if (Number(annotated?.season) !== Number(seasonNum) || Number(annotated?.episode) !== Number(episodeNum)) return false;
+        let episodeAnnotated = null;
+        let episodeMatchState = 'none';
+        let isRequestedSeasonPack = false;
+        if (type === 'series' && Number.isFinite(seasonNum) && Number.isFinite(episodeNum)) {
+          episodeAnnotated = (item?.season !== undefined || item?.episode !== undefined)
+            ? item
+            : annotateNzbResult(item, 0);
+          episodeMatchState = getEpisodeMatchState(
+            item?.title || item?.Title || '',
+            { season: seasonNum, episode: episodeNum },
+            episodeAnnotated
+          );
+          const seasonMatchState = getSeasonMatchState(item?.title || item?.Title || '', seasonNum);
+          isRequestedSeasonPack = effIncludeSeasonPacks
+            && titleContainsSeasonPack(item?.title || item?.Title || '', seasonNum);
+
+          // Never trust an indexer's query matching when the release itself
+          // explicitly names a different season or episode.
+          if (episodeMatchState === 'mismatch') return false;
+          if (episodeMatchState === 'none' && seasonMatchState === 'mismatch') return false;
+
+          if (isRequestedSeasonPack) {
+            item.isSeasonPack = true;
+          }
+
+          // Treasure Maps' TVDB endpoint can return broad show-level results.
+          // Require either the exact episode or an explicitly recognised pack.
+          if (isTvdbPlan && isSceneNzbs && episodeMatchState !== 'exact' && !isRequestedSeasonPack) {
+            return false;
+          }
         }
         if (!plan?.strictMatch || !plan.strictPhrase) return true;
-        const annotated = (item?.parsedTitle || item?.parsedTitleDisplay || item?.season || item?.episode || item?.year)
-          ? item
-          : annotateNzbResult(item, 0);
+        const annotated = episodeAnnotated || (
+          (item?.parsedTitle || item?.parsedTitleDisplay || item?.season || item?.episode || item?.year)
+            ? item
+            : annotateNzbResult(item, 0)
+        );
         const candidateTitle = (annotated?.parsedTitle || annotated?.title || annotated?.Title || '').trim();
         const strictTitlePhrase = (() => {
           try {
@@ -2684,29 +2744,42 @@ async function streamHandler(req, res) {
           return false;
         }
         if (type === 'series' && Number.isFinite(seasonNum) && Number.isFinite(episodeNum)) {
-          if (!Number.isFinite(annotated?.season) || !Number.isFinite(annotated?.episode)) {
-            if (isNewznabDebugEnabled()) {
-              console.log(`${INDEXER_LOG_PREFIX} Strict text match failed (missing season/episode)`, {
-                title: candidateTitle,
-                season: annotated?.season ?? null,
-                episode: annotated?.episode ?? null,
-                query: plan.query,
-              });
+          if (plan.seasonPack) {
+            if (!isRequestedSeasonPack) {
+              if (isNewznabDebugEnabled()) {
+                console.log(`${INDEXER_LOG_PREFIX} Strict pack match failed`, {
+                  title: candidateTitle,
+                  expectedSeason: seasonNum,
+                  query: plan.query,
+                });
+              }
+              return false;
             }
-            return false;
-          }
-          if (Number(annotated.season) !== Number(seasonNum) || Number(annotated.episode) !== Number(episodeNum)) {
-            if (isNewznabDebugEnabled()) {
-              console.log(`${INDEXER_LOG_PREFIX} Strict text match failed (season/episode mismatch)`, {
-                title: candidateTitle,
-                season: annotated?.season ?? null,
-                episode: annotated?.episode ?? null,
-                expectedSeason: seasonNum,
-                expectedEpisode: episodeNum,
-                query: plan.query,
-              });
+          } else {
+            if (!Number.isFinite(annotated?.season) || !Number.isFinite(annotated?.episode)) {
+              if (isNewznabDebugEnabled()) {
+                console.log(`${INDEXER_LOG_PREFIX} Strict text match failed (missing season/episode)`, {
+                  title: candidateTitle,
+                  season: annotated?.season ?? null,
+                  episode: annotated?.episode ?? null,
+                  query: plan.query,
+                });
+              }
+              return false;
             }
-            return false;
+            if (Number(annotated.season) !== Number(seasonNum) || Number(annotated.episode) !== Number(episodeNum)) {
+              if (isNewznabDebugEnabled()) {
+                console.log(`${INDEXER_LOG_PREFIX} Strict text match failed (season/episode mismatch)`, {
+                  title: candidateTitle,
+                  season: annotated?.season ?? null,
+                  episode: annotated?.episode ?? null,
+                  expectedSeason: seasonNum,
+                  expectedEpisode: episodeNum,
+                  query: plan.query,
+                });
+              }
+              return false;
+            }
           }
         }
         if (type === 'movie' && Number.isFinite(releaseYear)) {
@@ -3107,6 +3180,7 @@ async function streamHandler(req, res) {
     const annotateContext = {
       originalLanguage: tmdbMetadata?.originalLanguage || null,
       runtimeMinutes: tmdbMetadata?.runtimeMinutes || null,
+      episodesInSeason: Number(tmdbMetadata?.seasonEpisodeCounts?.[String(seasonNum)]) || null,
     };
     finalNzbResults = finalNzbResults.map((result, index) => annotateNzbResult(result, index, annotateContext));
 
@@ -3846,6 +3920,7 @@ async function streamHandler(req, res) {
       const tags = [];
       if (triageTag) tags.push(triageTag);
       if (isInstant && effStreamingMode !== 'native') tags.push('⚡ Instant');
+      if (result.isSeasonPack) tags.push('📦 Season Pack');
       if (preferredLanguageLabels.length > 0) {
         preferredLanguageLabels.forEach((language) => tags.push(language));
       }
@@ -4130,6 +4205,8 @@ async function streamHandler(req, res) {
             languages: releaseLanguages,
             indexerLanguage: sourceLanguage,
             resolution: detectedResolutionToken || null,
+            seasonPack: Boolean(result.isSeasonPack),
+            estimatedEpisodeSize: result.estimatedEpisodeSize || null,
             preferredLanguageMatch: preferredLanguageHit,
             preferredLanguageName: matchedPreferredLanguage,
             preferredLanguageNames: preferredLanguageMatches,
