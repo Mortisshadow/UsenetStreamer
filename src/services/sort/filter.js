@@ -146,7 +146,11 @@ function filterStreams(streams, filters = {}, opts = {}) {
 
   const dropLog = Array.isArray(opts.dropLog) ? opts.dropLog : null;
   const drop = (stream, reason) => {
-    if (dropLog) dropLog.push({ title: stream && (stream.title || stream.Title) || null, reason });
+    if (dropLog) dropLog.push({
+      title: stream && (stream.title || stream.Title) || null,
+      reason,
+      seasonPack: stream?.isSeasonPack === true,
+    });
     return false;
   };
 

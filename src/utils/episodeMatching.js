@@ -39,9 +39,53 @@ function extractSeasonEpisodePairs(title) {
   return pairs;
 }
 
+// Batch releases commonly encode a contiguous range rather than listing each
+// episode: S02E01-E25, S02E01-25, S02E01-S02E25, or
+// "Season 2 Episodes 1-25". These are multi-file/combined packs from the
+// addon's perspective and may serve any requested episode inside the range.
+function extractSeasonEpisodeRanges(title) {
+  const raw = String(title || '');
+  const ranges = [];
+  const seen = new Set();
+  const add = (season, startEpisode, endEpisode, endSeason = season) => {
+    const s = Number(season);
+    const endS = Number(endSeason);
+    const a = Number(startEpisode);
+    const b = Number(endEpisode);
+    if (![s, endS, a, b].every(Number.isFinite) || s !== endS || a <= 0 || b <= 0 || a === b) return;
+    const start = Math.min(a, b);
+    const end = Math.max(a, b);
+    const key = `${s}:${start}-${end}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    ranges.push({ season: s, startEpisode: start, endEpisode: end });
+  };
+
+  // S02E01-E25 / S02E01-25 / S02E01-S02E25 (also en/em dash).
+  for (const match of raw.matchAll(/(?:^|[^a-z0-9])s(\d{1,3})[\s._-]*e(\d{1,4})[\s._-]*(?:to|through|[-–—])[\s._-]*(?:s(\d{1,3})[\s._-]*)?e?(\d{1,4})(?!\d)/gi)) {
+    add(match[1], match[2], match[4], match[3] || match[1]);
+  }
+
+  // S02 Episodes 01-25 / Season 2 Ep 1 through 25.
+  for (const match of raw.matchAll(/(?:^|[^a-z0-9])(?:s|season[\s._-]*)(\d{1,3})[\s._-]*(?:episodes?|eps?)[\s._-]*(\d{1,4})[\s._-]*(?:to|through|[-–—])[\s._-]*(\d{1,4})(?!\d)/gi)) {
+    add(match[1], match[2], match[3]);
+  }
+
+  return ranges;
+}
+
 function getEpisodeMatchState(title, requestedEpisode, metadata = null) {
   const requested = normalizeRequestedEpisode(requestedEpisode);
   if (!requested) return 'none';
+
+  const ranges = extractSeasonEpisodeRanges(title);
+  if (ranges.length > 0) {
+    return ranges.some((range) => range.season === requested.season
+      && requested.episode >= range.startEpisode
+      && requested.episode <= range.endEpisode)
+      ? 'exact'
+      : 'mismatch';
+  }
 
   const pairs = extractSeasonEpisodePairs(title);
   const parsedSeason = Number(metadata?.season);
@@ -95,10 +139,18 @@ function getSeasonMatchState(title, requestedSeason) {
   return seasonTokens.includes(season) ? 'exact' : 'mismatch';
 }
 
-function titleContainsSeasonPack(title, requestedSeason) {
+function titleContainsSeasonPack(title, requestedSeason, requestedEpisode = null) {
   const season = Number(requestedSeason);
   if (!Number.isFinite(season)) return false;
   const raw = String(title || '');
+
+  const episode = Number(requestedEpisode);
+  const episodeRanges = extractSeasonEpisodeRanges(raw);
+  if (episodeRanges.length > 0) {
+    return episodeRanges.some((range) => range.season === season
+      && (!Number.isFinite(episode)
+        || (episode >= range.startEpisode && episode <= range.endEpisode)));
+  }
 
   // A release carrying an episode marker is an episode/multi-episode release,
   // not a season pack. It must go through exact episode validation instead.
@@ -117,6 +169,7 @@ function titleContainsSeasonPack(title, requestedSeason) {
 
 module.exports = {
   extractSeasonEpisodePairs,
+  extractSeasonEpisodeRanges,
   getEpisodeMatchState,
   getSeasonMatchState,
   titleContainsSeasonPack,

@@ -667,7 +667,7 @@
           <div class="field-grid">
             <label class="wide-field">Stream Label Fields (Short Name)
               <textarea name="NZB_DISPLAY_NAME_PATTERN" class="pattern-input" rows="2" placeholder='addon, health, instant, resolution'></textarea>
-              <span class="field-hint">Comma-separated fields. Example: <code>addon, health, instant, resolution</code>. <code>quality</code> and <code>resolution</code> both show resolution. Use <code>stream_quality</code> for actual parsed quality only. Advanced templates are still supported if you use <code>{...}</code>.</span>
+              <span class="field-hint">Comma-separated fields. Example: <code>addon, health, instant, season_pack, resolution</code>. <code>quality</code> and <code>resolution</code> both show resolution. Use <code>stream_quality</code> for actual parsed quality only. Advanced templates are still supported if you use <code>{...}</code>.</span>
             </label>
             <label class="wide-field">Description Fields (Long Title)
               <textarea name="NZB_NAMING_PATTERN" class="pattern-input" rows="6" placeholder='title,
@@ -683,7 +683,7 @@ date,
 languages,
 indexer,
 health'></textarea>
-              <span class="field-hint">Comma-separated fields. Example: <code>title, filename, stream_quality, source, codec, visual, audio, group, size, bitrate, languages, indexer, files, date, health</code>. See <strong>What each field means</strong> below for every field (<code>bitrate</code> needs TMDb runtime). Advanced templates are still supported if you use <code>{...}</code>.</span>
+              <span class="field-hint">Comma-separated fields. Example: <code>season_pack, title, filename, stream_quality, source, codec, visual, audio, group, size, bitrate, languages, indexer, files, date, health</code>. See <strong>What each field means</strong> below for every field (<code>bitrate</code> needs TMDb runtime). Advanced templates are still supported if you use <code>{...}</code>.</span>
             </label>
             <details class="option-suggestions wide-field">
               <summary>What each field means</summary>
@@ -703,6 +703,7 @@ health'></textarea>
                 <code>indexer</code> — indexer name<br>
                 <code>health</code> — health-check result (✅ / ❌)<br>
                 <code>instant</code> — instant-play ⚡ marker<br>
+                <code>season_pack</code> — 📦 marker for full-season or episode-range packs<br>
                 <code>files</code> — number of files in the NZB (the video plus extras like sample, .nfo and .par2 repair files), when the indexer reports it<br>
                 <code>grabs</code> — how many times the release has been downloaded · <code>date</code> — publish date<br>
                 <code>addon</code> — addon name

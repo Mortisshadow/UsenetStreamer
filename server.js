@@ -2715,7 +2715,7 @@ async function streamHandler(req, res) {
           );
           const seasonMatchState = getSeasonMatchState(item?.title || item?.Title || '', seasonNum);
           isRequestedSeasonPack = effIncludeSeasonPacks
-            && titleContainsSeasonPack(item?.title || item?.Title || '', seasonNum);
+            && titleContainsSeasonPack(item?.title || item?.Title || '', seasonNum, episodeNum);
 
           // Never trust an indexer's query matching when the release itself
           // explicitly names a different season or episode.
@@ -3072,6 +3072,14 @@ async function streamHandler(req, res) {
           return resultMatchesStrictPlan(plan, item);
         });
 
+        if (plan.seasonPack) {
+          console.log(`${INDEXER_LOG_PREFIX} 📦 Season-pack candidates accepted`, {
+            query: plan.query,
+            accepted: filteredResults.length,
+            samples: filteredResults.slice(0, 5).map((item) => item.title || item.Title || '(untitled)'),
+          });
+        }
+
         filteredResults.forEach((item) => rawAggregatedResults.push({ result: item, planType: plan.type }));
 
         let addedCount = 0;
@@ -3337,6 +3345,10 @@ async function streamHandler(req, res) {
       const filterInputCount = finalNzbResults.length;
       const filterDropLog = [];
       finalNzbResults = filterStreams(finalNzbResults, unified.filters, { dropLog: filterDropLog });
+      const droppedPacks = filterDropLog.filter((entry) => entry.seasonPack);
+      if (droppedPacks.length > 0) {
+        console.log('[SORT][FILTER] 📦 Season packs removed by hard filters:', droppedPacks.slice(0, 10));
+      }
       // When the filter removes everything (or nearly everything), surface WHY —
       // otherwise a bare "sorted=0" looks like a coverage failure when it's
       // really an over-restrictive filter. Group drops by gate + show samples.
@@ -3397,7 +3409,16 @@ async function streamHandler(req, res) {
     // doesn't, so we apply it here so existing users get the same cap.
     if (Number.isFinite(effResolutionLimit) && effResolutionLimit > 0) {
       const { applyResolutionLimits } = require('./src/utils/helpers');
+      const packsBeforeLimit = finalNzbResults.filter((result) => result.isSeasonPack).length;
       finalNzbResults = applyResolutionLimits(finalNzbResults, effResolutionLimit);
+      const packsAfterLimit = finalNzbResults.filter((result) => result.isSeasonPack).length;
+      if (packsBeforeLimit !== packsAfterLimit) {
+        console.log('[SORT][LIMIT] 📦 Season packs removed by per-resolution cap', {
+          before: packsBeforeLimit,
+          after: packsAfterLimit,
+          limit: effResolutionLimit,
+        });
+      }
     }
 
     if (triagePrewarmPromise) {
@@ -4047,6 +4068,7 @@ async function streamHandler(req, res) {
         shortName: namingContext.indexer,
         cached: isInstant || Boolean(triageTag && triageTag.includes('✅')),
         instant: isInstant,
+        seasonPack: Boolean(result.isSeasonPack),
         files: Number.isFinite(result.files) ? result.files : null,
         grabs: Number.isFinite(result.grabs) ? result.grabs : null,
         date: result.publishDateMs ? new Date(result.publishDateMs).toISOString().slice(0, 10) : null,
@@ -4083,6 +4105,8 @@ async function streamHandler(req, res) {
           addon: '{addon.name}',
           title: '{stream.title::exists["{stream.title}"||""]}',
           instant: '{stream.instant::istrue["⚡"||""]}',
+          season_pack: '{stream.seasonPack::istrue["📦 Season Pack"||""]}',
+          seasonpack: '{stream.seasonPack::istrue["📦 Season Pack"||""]}',
           health: '{stream.health::exists["{stream.health}"||""]}',
           quality: '{stream.resolution::exists["{stream.resolution}"||""]}',
           resolution_quality: '{stream.resolution::exists["{stream.resolution}"||""]}',
@@ -4117,6 +4141,8 @@ async function streamHandler(req, res) {
           indexer: '{stream.indexer::exists["🔎 {stream.indexer}"||""]}',
           health: '{stream.health::exists["🧪 {stream.health}"||""]}',
           instant: '{stream.instant::istrue["⚡ Instant"||""]}',
+          season_pack: '{stream.seasonPack::istrue["📦 Season Pack"||""]}',
+          seasonpack: '{stream.seasonPack::istrue["📦 Season Pack"||""]}',
           files: '{stream.files::exists["📁 {stream.files} files"||""]}',
           grabs: '{stream.grabs::exists["⬇️ {stream.grabs} grabs"||""]}',
           date: '{stream.date::exists["📅 {stream.date}"||""]}',
@@ -4158,13 +4184,13 @@ async function streamHandler(req, res) {
       };
 
       // Default stream description template
-      const defaultDescriptionPattern = '{stream.title::exists["🎬 {stream.title}\n"||""]}{stream.source::exists["🎥 {stream.source} "||""]}{stream.encode::exists["🎞️ {stream.encode}\n"||"\n"]}{stream.visualTags::join(\' | \')::exists["📺 {stream.visualTags::join(\' | \')}\n"||""]}{stream.audioTags::join(\' \')::exists["🎧 {stream.audioTags::join(\' \')}\n"||""]}{stream.releaseGroup::exists["👥 {stream.releaseGroup}\n"||""]}{stream.size::>0["📦 {stream.size::bytes}\n"||""]}{stream.languages::join(\' \')::exists["🌎 {stream.languages::join(\' \')}\n"||""]}{stream.indexer::exists["🔎 {stream.indexer}"||""]}';
-      const effectiveDefaultDescriptionPattern = `{stream.title::exists["🎬 {stream.title}\n"||""]}{stream.streamQuality::exists["✨ {stream.streamQuality}\n"||""]}{stream.source::exists["🎥 {stream.source}\n"||""]}{stream.encode::exists["🎞️ {stream.encode}\n"||""]}{stream.visualTags::join(" | ")::exists["📺 {stream.visualTags::join(\" | \")}\n"||""]}{stream.audioTags::join(" ")::exists["🎧 {stream.audioTags::join(\" \")}\n"||""]}{stream.releaseGroup::exists["👥 {stream.releaseGroup}\n"||""]}{stream.size::>0["📦 {stream.size::bytes}\n"||""]}{stream.languages::join(" ")::exists["🌎 {stream.languages::join(\" \")}\n"||""]}{stream.indexer::exists["🔎 {stream.indexer}\n"||""]}{stream.health::exists["🧪 {stream.health}"||""]}`;
+      const defaultDescriptionPattern = '{stream.title::exists["🎬 {stream.title}\n"||""]}{stream.seasonPack::istrue["📦 Season Pack\n"||""]}{stream.source::exists["🎥 {stream.source} "||""]}{stream.encode::exists["🎞️ {stream.encode}\n"||"\n"]}{stream.visualTags::join(\' | \')::exists["📺 {stream.visualTags::join(\' | \')}\n"||""]}{stream.audioTags::join(\' \')::exists["🎧 {stream.audioTags::join(\' \')}\n"||""]}{stream.releaseGroup::exists["👥 {stream.releaseGroup}\n"||""]}{stream.size::>0["📦 {stream.size::bytes}\n"||""]}{stream.languages::join(\' \')::exists["🌎 {stream.languages::join(\' \')}\n"||""]}{stream.indexer::exists["🔎 {stream.indexer}"||""]}';
+      const effectiveDefaultDescriptionPattern = `{stream.title::exists["🎬 {stream.title}\n"||""]}{stream.seasonPack::istrue["📦 Season Pack\n"||""]}{stream.streamQuality::exists["✨ {stream.streamQuality}\n"||""]}{stream.source::exists["🎥 {stream.source}\n"||""]}{stream.encode::exists["🎞️ {stream.encode}\n"||""]}{stream.visualTags::join(" | ")::exists["📺 {stream.visualTags::join(\" | \")}\n"||""]}{stream.audioTags::join(" ")::exists["🎧 {stream.audioTags::join(\" \")}\n"||""]}{stream.releaseGroup::exists["👥 {stream.releaseGroup}\n"||""]}{stream.size::>0["📦 {stream.size::bytes}\n"||""]}{stream.languages::join(" ")::exists["🌎 {stream.languages::join(\" \")}\n"||""]}{stream.indexer::exists["🔎 {stream.indexer}\n"||""]}{stream.health::exists["🧪 {stream.health}"||""]}`;
       const effectiveDescriptionPattern = buildPatternFromTokenList(profileEff ? profileEff.config.NZB_NAMING_PATTERN : NZB_NAMING_PATTERN, 'long', effectiveDefaultDescriptionPattern);
       const formattedTitle = formatStreamTitle(effectiveDescriptionPattern, namingContext, effectiveDefaultDescriptionPattern);
 
-      const defaultNamePattern = '{addon.name} {stream.health::exists["{stream.health} "||""]}{stream.instant::istrue["⚡ "||""]}{stream.resolution::exists["{stream.resolution}"||""]}';
-      const effectiveDefaultNamePattern = '{addon.name} {stream.health::exists["{stream.health} "||""]}{stream.instant::istrue["⚡ "||""]}{stream.resolution::exists["{stream.resolution}"||""]}';
+      const defaultNamePattern = '{addon.name} {stream.health::exists["{stream.health} "||""]}{stream.instant::istrue["⚡ "||""]}{stream.seasonPack::istrue["📦 Pack "||""]}{stream.resolution::exists["{stream.resolution}"||""]}';
+      const effectiveDefaultNamePattern = '{addon.name} {stream.health::exists["{stream.health} "||""]}{stream.instant::istrue["⚡ "||""]}{stream.seasonPack::istrue["📦 Pack "||""]}{stream.resolution::exists["{stream.resolution}"||""]}';
       const effectiveNamePattern = buildPatternFromTokenList(profileEff ? profileEff.config.NZB_DISPLAY_NAME_PATTERN : NZB_DISPLAY_NAME_PATTERN, 'short', effectiveDefaultNamePattern);
       const formattedName = formatStreamTitle(effectiveNamePattern, namingContext, effectiveDefaultNamePattern);
 
