@@ -881,15 +881,15 @@ function deriveStreamProtection() {
 }
 let TRIAGE_TIME_BUDGET_MS = toPositiveInt(process.env.NZB_TRIAGE_TIME_BUDGET_MS, 25000);
 let TRIAGE_MAX_CANDIDATES = toPositiveInt(process.env.NZB_TRIAGE_MAX_CANDIDATES, 25);
-let TRIAGE_DOWNLOAD_CONCURRENCY = toPositiveInt(process.env.NZB_TRIAGE_DOWNLOAD_CONCURRENCY, 8);
+let TRIAGE_DOWNLOAD_CONCURRENCY = toPositiveInt(process.env.NZB_TRIAGE_DOWNLOAD_CONCURRENCY, 4);
 let TRIAGE_PRIORITY_INDEXERS = parseCommaList(process.env.NZB_TRIAGE_PRIORITY_INDEXERS);
 let TRIAGE_PRIORITY_INDEXER_LIMITS = parseCommaList(process.env.NZB_TRIAGE_PRIORITY_INDEXER_LIMITS);
 let TRIAGE_HEALTH_INDEXERS = parseCommaList(process.env.NZB_TRIAGE_HEALTH_INDEXERS);
 let TRIAGE_SERIALIZED_INDEXERS = parseCommaList(process.env.NZB_TRIAGE_SERIALIZED_INDEXERS);
 let TRIAGE_NNTP_CONFIG = buildTriageNntpConfig();
 let TRIAGE_MAX_DECODED_BYTES = toPositiveInt(process.env.NZB_TRIAGE_MAX_DECODED_BYTES, 32 * 1024);
-let TRIAGE_NNTP_MAX_CONNECTIONS = toPositiveInt(process.env.NZB_TRIAGE_MAX_CONNECTIONS, 12);
-let TRIAGE_MAX_PARALLEL_NZBS = toPositiveInt(process.env.NZB_TRIAGE_MAX_PARALLEL_NZBS, 16);
+let TRIAGE_NNTP_MAX_CONNECTIONS = toPositiveInt(process.env.NZB_TRIAGE_MAX_CONNECTIONS, 6);
+let TRIAGE_MAX_PARALLEL_NZBS = toPositiveInt(process.env.NZB_TRIAGE_MAX_PARALLEL_NZBS, 4);
 let TRIAGE_STAT_SAMPLE_COUNT = 0;
 let TRIAGE_ARCHIVE_SAMPLE_COUNT = 1;
 let TRIAGE_REUSE_POOL = toBoolean(process.env.NZB_TRIAGE_REUSE_POOL, true);
@@ -942,12 +942,48 @@ const UPFRONT_PAYLOAD_CACHE_TTL_MS = 10 * 60 * 1000;
 // Cap entries so a burst of triage downloads can't balloon RAM with raw NZB
 // bytes (each entry is a full NZB payload). Oldest-inserted evicted first.
 const UPFRONT_PAYLOAD_CACHE_MAX = 40;
+const UPFRONT_PAYLOAD_CACHE_MAX_BYTES = (() => {
+  const configuredMb = Number(process.env.NZB_TRIAGE_PAYLOAD_CACHE_MAX_MB);
+  return (Number.isFinite(configuredMb) && configuredMb >= 0 ? configuredMb : 32) * 1024 * 1024;
+})();
 const upfrontNzbPayloadCache = new Map();
+let upfrontNzbPayloadCacheBytes = 0;
+
+function getPayloadBytes(payload) {
+  if (Buffer.isBuffer(payload)) return payload.length;
+  return Buffer.byteLength(String(payload || ''), 'utf8');
+}
+
+function deleteUpfrontPayloadCacheEntry(url) {
+  const existing = upfrontNzbPayloadCache.get(url);
+  if (!existing) return false;
+  upfrontNzbPayloadCache.delete(url);
+  upfrontNzbPayloadCacheBytes = Math.max(0, upfrontNzbPayloadCacheBytes - (existing.bytes || 0));
+  return true;
+}
+
+function logMemoryUsage(stage, extra = {}) {
+  if (!toBoolean(process.env.NZB_MEMORY_LOGGING, false)) return;
+  const usage = process.memoryUsage();
+  const mb = (bytes) => Math.round((bytes / (1024 * 1024)) * 10) / 10;
+  console.log('[MEMORY]', {
+    stage,
+    rssMb: mb(usage.rss),
+    heapUsedMb: mb(usage.heapUsed),
+    heapTotalMb: mb(usage.heapTotal),
+    externalMb: mb(usage.external),
+    arrayBuffersMb: mb(usage.arrayBuffers || 0),
+    upfrontPayloadCacheMb: mb(upfrontNzbPayloadCacheBytes),
+    upfrontPayloadCacheEntries: upfrontNzbPayloadCache.size,
+    ...extra,
+  });
+}
+
 function getOrPruneUpfrontPayloadCache() {
   const now = Date.now();
   for (const [url, entry] of upfrontNzbPayloadCache) {
     if (now - entry.ts > UPFRONT_PAYLOAD_CACHE_TTL_MS) {
-      upfrontNzbPayloadCache.delete(url);
+      deleteUpfrontPayloadCacheEntry(url);
     }
   }
   // Return a thin wrapper that the runner can use as a standard Map
@@ -956,17 +992,22 @@ function getOrPruneUpfrontPayloadCache() {
       const entry = upfrontNzbPayloadCache.get(url);
       if (!entry) return undefined;
       if (Date.now() - entry.ts > UPFRONT_PAYLOAD_CACHE_TTL_MS) {
-        upfrontNzbPayloadCache.delete(url);
+        deleteUpfrontPayloadCacheEntry(url);
         return undefined;
       }
       return entry.payload;
     },
     set(url, payload) {
-      upfrontNzbPayloadCache.set(url, { payload, ts: Date.now() });
-      while (upfrontNzbPayloadCache.size > UPFRONT_PAYLOAD_CACHE_MAX) {
+      const bytes = getPayloadBytes(payload);
+      deleteUpfrontPayloadCacheEntry(url);
+      if (UPFRONT_PAYLOAD_CACHE_MAX_BYTES === 0 || bytes > UPFRONT_PAYLOAD_CACHE_MAX_BYTES) return;
+      upfrontNzbPayloadCache.set(url, { payload, bytes, ts: Date.now() });
+      upfrontNzbPayloadCacheBytes += bytes;
+      while (upfrontNzbPayloadCache.size > UPFRONT_PAYLOAD_CACHE_MAX
+        || upfrontNzbPayloadCacheBytes > UPFRONT_PAYLOAD_CACHE_MAX_BYTES) {
         const oldestKey = upfrontNzbPayloadCache.keys().next().value;
         if (oldestKey === undefined) break;
-        upfrontNzbPayloadCache.delete(oldestKey);
+        deleteUpfrontPayloadCacheEntry(oldestKey);
       }
     },
     has(url) {
@@ -1152,7 +1193,7 @@ function rebuildRuntimeConfig({ log = true } = {}) {
   deriveStreamProtection();
   TRIAGE_TIME_BUDGET_MS = toPositiveInt(process.env.NZB_TRIAGE_TIME_BUDGET_MS, 25000);
   TRIAGE_MAX_CANDIDATES = toPositiveInt(process.env.NZB_TRIAGE_MAX_CANDIDATES, 25);
-  TRIAGE_DOWNLOAD_CONCURRENCY = toPositiveInt(process.env.NZB_TRIAGE_DOWNLOAD_CONCURRENCY, 8);
+  TRIAGE_DOWNLOAD_CONCURRENCY = toPositiveInt(process.env.NZB_TRIAGE_DOWNLOAD_CONCURRENCY, 4);
   TRIAGE_PRIORITY_INDEXERS = parseCommaList(process.env.NZB_TRIAGE_PRIORITY_INDEXERS);
   TRIAGE_PRIORITY_INDEXER_LIMITS = parseCommaList(process.env.NZB_TRIAGE_PRIORITY_INDEXER_LIMITS);
   TRIAGE_HEALTH_INDEXERS = parseCommaList(process.env.NZB_TRIAGE_HEALTH_INDEXERS);
@@ -1160,8 +1201,8 @@ function rebuildRuntimeConfig({ log = true } = {}) {
   refreshPaidIndexerTokens();
   TRIAGE_NNTP_CONFIG = buildTriageNntpConfig();
   TRIAGE_MAX_DECODED_BYTES = toPositiveInt(process.env.NZB_TRIAGE_MAX_DECODED_BYTES, 32 * 1024);
-  TRIAGE_NNTP_MAX_CONNECTIONS = toPositiveInt(process.env.NZB_TRIAGE_MAX_CONNECTIONS, 12);
-  TRIAGE_MAX_PARALLEL_NZBS = toPositiveInt(process.env.NZB_TRIAGE_MAX_PARALLEL_NZBS, 16);
+  TRIAGE_NNTP_MAX_CONNECTIONS = toPositiveInt(process.env.NZB_TRIAGE_MAX_CONNECTIONS, 6);
+  TRIAGE_MAX_PARALLEL_NZBS = toPositiveInt(process.env.NZB_TRIAGE_MAX_PARALLEL_NZBS, 4);
   TRIAGE_REUSE_POOL = toBoolean(process.env.NZB_TRIAGE_REUSE_POOL, true);
   TRIAGE_NNTP_KEEP_ALIVE_MS = toPositiveInt(process.env.NZB_TRIAGE_NNTP_KEEP_ALIVE_MS, 0);
   TRIAGE_BASE_OPTIONS = {
@@ -3553,7 +3594,7 @@ async function streamHandler(req, res) {
           serializedIndexerIds: serializedIndexerTokens,
           timeBudgetMs: TRIAGE_TIME_BUDGET_MS,
           maxCandidates: TRIAGE_MAX_CANDIDATES,
-          downloadConcurrency: Math.max(1, TRIAGE_MAX_CANDIDATES),
+          downloadConcurrency: Math.max(1, Math.min(TRIAGE_DOWNLOAD_CONCURRENCY, TRIAGE_MAX_CANDIDATES)),
           triageOptions: {
             ...TRIAGE_BASE_OPTIONS,
             nntpConfig: { ...TRIAGE_NNTP_CONFIG },
@@ -3564,6 +3605,7 @@ async function streamHandler(req, res) {
         };
         try {
           triageOutcome = await triageAndRank(triageCandidatesToRun, triageOptions);
+          logMemoryUsage('blocking-triage-complete', { candidates: triageCandidatesToRun.length });
           const latestDecisions = triageOutcome?.decisions instanceof Map ? triageOutcome.decisions : new Map(triageOutcome?.decisions || []);
           latestDecisions.forEach((decision, downloadUrl) => {
             triageDecisions.set(downloadUrl, decision);
@@ -4355,6 +4397,7 @@ async function streamHandler(req, res) {
     }
 
     const requestElapsedMs = Date.now() - requestStartTs;
+    logMemoryUsage('stream-response', { results: finalNzbResults.length, streams: streams.length });
     const modeLabel = effStreamingMode === 'native' ? 'native NZB' : 'NZB';
     console.log(`[STREMIO] Returning ${streams.length} ${modeLabel} streams`, { elapsedMs: requestElapsedMs, ts: new Date().toISOString() });
     if (process.env.DEBUG_STREAM_PAYLOADS === 'true') {
@@ -4407,7 +4450,7 @@ async function streamHandler(req, res) {
             serializedIndexerIds: serializedIndexerTokens,
             timeBudgetMs: TRIAGE_TIME_BUDGET_MS,
             maxCandidates: TRIAGE_MAX_CANDIDATES,
-            downloadConcurrency: Math.max(1, TRIAGE_MAX_CANDIDATES),
+            downloadConcurrency: Math.max(1, Math.min(TRIAGE_DOWNLOAD_CONCURRENCY, TRIAGE_MAX_CANDIDATES)),
             triageOptions: {
               ...TRIAGE_BASE_OPTIONS,
               nntpConfig: { ...TRIAGE_NNTP_CONFIG },
