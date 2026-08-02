@@ -2342,7 +2342,7 @@
   function setSortImportStatus(text, isError = false) {
     if (!sortImportStatus) return;
     sortImportStatus.textContent = text || '';
-    sortImportStatus.style.color = isError ? 'var(--danger, #ff8d9b)' : 'var(--text-muted)';
+    sortImportStatus.style.color = isError ? 'var(--danger, #ffffff)' : 'var(--text-muted)';
   }
 
   function renderSortImportPreview(data) {
@@ -2702,7 +2702,7 @@
             // Trigger a visual feedback or flash the textarea
             textarea.focus();
             textarea.style.transition = 'box-shadow 0.2s ease';
-            textarea.style.boxShadow = '0 0 0 4px rgba(62, 180, 255, 0.3)';
+            textarea.style.boxShadow = '0 0 0 4px rgba(255, 255, 255, 0.28)';
             setTimeout(() => {
               textarea.style.boxShadow = '';
             }, 300);

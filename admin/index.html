@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>UsenetStreamer Control Panel</title>
   <link rel="manifest" href="manifest.json" />
-  <meta name="theme-color" content="#0b1118" />
+  <meta name="theme-color" content="#050505" />
   <meta name="mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <link rel="apple-touch-icon" href="/assets/icon.png" />
@@ -14,14 +14,14 @@
   <style>
     /* Profile switcher — a sibling sub-panel matching the form's .group panels,
        with tabs styled as pill buttons using the shared button language. */
-    .profile-switcher { background: var(--bg-panel); border: 1px solid rgba(86,110,135,0.25); border-radius: var(--radius-md); padding: 1.4rem 1.6rem; margin: 0; display: flex; flex-direction: column; gap: 0.9rem; box-shadow: 0 18px 40px rgba(2,12,24,0.4); }
+    .profile-switcher { background: var(--bg-panel); border: 1px solid var(--border-soft); border-radius: var(--radius-md); padding: 1.4rem 1.6rem; margin: 0; display: flex; flex-direction: column; gap: 0.9rem; box-shadow: var(--shadow-soft); }
     .profile-tabs { display: flex; flex-wrap: wrap; gap: 0.55rem; align-items: center; }
-    .profile-tab { padding: 0.55rem 1.2rem; border-radius: 999px; border: 1px solid var(--border-strong); background: rgba(62,84,110,0.22); color: var(--text-secondary); cursor: pointer; font-size: 0.92rem; font-weight: 600; line-height: 1.2; transition: transform 120ms ease, background 160ms ease, color 160ms ease, border-color 160ms ease, box-shadow 180ms ease; }
-    .profile-tab:hover { background: rgba(62,84,110,0.42); border-color: rgba(95,180,255,0.6); color: var(--text-primary); transform: translateY(-1px); }
-    .profile-tab.active { background: var(--accent-gradient); color: #051521; border-color: transparent; text-shadow: 0 1px 0 rgba(255,255,255,0.35); box-shadow: var(--shadow-lift); }
+    .profile-tab { padding: 0.55rem 1.2rem; border-radius: 999px; border: 1px solid var(--border-strong); background: rgba(255,255,255,0.05); color: var(--text-secondary); cursor: pointer; font-size: 0.92rem; font-weight: 600; line-height: 1.2; transition: transform 120ms ease, background 160ms ease, color 160ms ease, border-color 160ms ease, box-shadow 180ms ease; }
+    .profile-tab:hover { background: rgba(255,255,255,0.11); border-color: rgba(255,255,255,0.55); color: var(--text-primary); transform: translateY(-1px); }
+    .profile-tab.active { background: var(--accent-gradient); color: #070707; border-color: transparent; box-shadow: var(--shadow-lift); }
     .profile-tab.active:hover { transform: translateY(-1px); }
-    .profile-tab-add { background: transparent; border: 1.5px dashed rgba(95,120,150,0.7); color: var(--text-secondary); }
-    .profile-tab-add:hover { background: transparent; border-color: rgba(95,180,255,0.6); color: #9fdcff; }
+    .profile-tab-add { background: transparent; border: 1.5px dashed var(--border-strong); color: var(--text-secondary); }
+    .profile-tab-add:hover { background: transparent; border-color: #fff; color: var(--text-primary); }
     .profile-edit-row { display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; margin: 0; }
     .profile-edit-row #profileNameInput { flex: 1 1 220px; min-width: 160px; }
     .profile-inherit { opacity: 0.45; }
@@ -36,7 +36,7 @@
        in "Addon Name") stay global — hide them while editing a profile. */
     #configForm.profile-mode .profile-foreign-field { display: none !important; }
     /* Keep the Save bar reachable instead of buried at the bottom of a long form. */
-    .actions { position: sticky; bottom: 0; background: rgba(11,17,24,0.96); backdrop-filter: blur(4px); padding: 0.85rem 0.25rem; margin-top: 1rem; z-index: 5; border-top: 1px solid rgba(80,140,220,0.18); }
+    .actions { position: sticky; bottom: 0; background: rgba(5,5,5,0.96); backdrop-filter: blur(8px); padding: 0.85rem 0.25rem; margin-top: 1rem; z-index: 5; border-top: 1px solid var(--border-soft); }
   </style>
 </head>
 <body>
