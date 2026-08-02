@@ -42,6 +42,13 @@ function extractSeasonEpisodePairs(title) {
     add(match[1], match[2]);
   }
 
+  // The same anime notation is also written with an expanded season token:
+  // "Season 2 - 17v2" or "Season 2 Episode 17". The optional v2 suffix is a
+  // revision marker, not part of the episode number.
+  for (const match of raw.matchAll(/\bseason[\s._-]*(\d{1,3})[\s._]*(?:[-–—]|episodes?|eps?|e)[\s._-]*(\d{1,4})(?:v\d+)?(?!\d|p\b)/gi)) {
+    add(match[1], match[2]);
+  }
+
   return pairs;
 }
 
@@ -206,6 +213,13 @@ function classifyPackTitle(title, requestedSeason, requestedEpisode = null) {
   // A season token used as an OVA/OAD/ONA volume label is not evidence of a
   // full season. This exact form appeared in real indexer output as S02.OVA.
   if (/(?:^|[^a-z0-9])(?:s\d{1,3}|season[\s._-]*\d{1,3})[\s._-]*(?:ova|oad|ona)\b/i.test(raw)) {
+    return null;
+  }
+
+  // A numbered disc/volume is only a slice of a season. Treating it as a
+  // complete season pack can expose the wrong episode and makes the broad
+  // fallback search look much noisier than it really is.
+  if (/\bvol(?:ume)?[\s._-]*(?:no[\s._-]*)?\d+(?:v\d+)?\b/i.test(raw)) {
     return null;
   }
 

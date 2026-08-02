@@ -326,11 +326,21 @@ function parseReleaseMetadata(title) {
   // markers in the languages array (they mean "multiple tracks", not a real
   // language). Strip them so they don't (a) pollute the exposed languages list
   // or (b) inflate the meta-language count below. We track the marker
-  // separately as `hasMultiMarker`.
+  // separately as `hasMultiMarker`. Subtitle-only markers such as
+  // "Multi-Subs" must not imply multiple audio tracks.
   const rawLanguages = Array.isArray(parsed.languages) ? parsed.languages : [];
   const realLanguages = rawLanguages.filter((lang) => !/\bmulti\b/i.test(String(lang)));
-  const hasMultiMarker = /\bmulti\b/i.test(rawTitle)
-    || rawLanguages.some((lang) => /\bmulti\b/i.test(String(lang)));
+  const multiSubsPattern = /\b(?:multi(?:ple)?[\s._-]*subs?(?:titles?)?|multisubs?|msubs?)\b/i;
+  const hasMultiSubsMarker = multiSubsPattern.test(rawTitle)
+    || rawLanguages.some((lang) => multiSubsPattern.test(String(lang)));
+  const titleWithoutMultiSubs = rawTitle.replace(
+    new RegExp(multiSubsPattern.source, 'gi'),
+    ' ',
+  );
+  const hasMultiMarker = /\bmulti(?:ple)?(?:[\s._-]*(?:audio|dub(?:bed|s)?|lang(?:uages?)?))?\b/i.test(titleWithoutMultiSubs)
+    || rawLanguages.some((lang) => (
+      /\bmulti\b/i.test(String(lang)) && !/\bsubs?(?:titles?)?\b/i.test(String(lang))
+    ));
 
   // Derive meta-language tokens from the parsed output. These describe the
   // release's audio shape (not a specific language) and are exposed alongside
@@ -345,9 +355,9 @@ function parseReleaseMetadata(title) {
     inferredLanguages.push('Multi');
   } else if (realLanguages.length === 0) {
     inferredLanguages.push('Unknown');
-  } else if (realLanguages.length === 2) {
+  } else if (!hasMultiSubsMarker && realLanguages.length === 2) {
     inferredLanguages.push('Dual Audio');
-  } else if (realLanguages.length >= 3) {
+  } else if (!hasMultiSubsMarker && realLanguages.length >= 3) {
     inferredLanguages.push('Multi');
   }
   if (parsed.dubbed) {

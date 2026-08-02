@@ -26,7 +26,14 @@ test('extracts common episode forms and multi-episode chains', () => {
   assert.deepEqual(extractSeasonEpisodePairs('Mob.Psycho.100.S2.-.05.720p'), [
     { season: 2, episode: 5 },
   ]);
+  assert.deepEqual(extractSeasonEpisodePairs('[IceBlue & Kaizoku] Jujutsu Kaisen Season 2 - 17v2 (BD 1080p x265 FLAC)'), [
+    { season: 2, episode: 17 },
+  ]);
+  assert.deepEqual(extractSeasonEpisodePairs('Jujutsu Kaisen Season 2 Episode 17'), [
+    { season: 2, episode: 17 },
+  ]);
   assert.deepEqual(extractSeasonEpisodePairs('Show S2-1080p BluRay'), []);
+  assert.deepEqual(extractSeasonEpisodePairs('Show Season 2 - 1080p BluRay'), []);
 });
 
 test('extracts batch episode ranges used by season and cour packs', () => {
@@ -85,6 +92,9 @@ test('recognises requested season packs and rejects wrong-season packs', () => {
   assert.equal(titleContainsSeasonPack('My.Hero.Academia.S02E01-25.1080p', 2, 25), true);
   assert.equal(titleContainsSeasonPack('My.Hero.Academia.S02E01-E04.1080p', 2, 5), false);
   assert.equal(titleContainsSeasonPack('My.Hero.Academia.S01E01-E25.1080p', 2, 5), false);
+  assert.equal(titleContainsSeasonPack('Jujutsu Kaisen Season 2 - 17v2 (BD 1080p)', 2, 1), false);
+  assert.equal(titleContainsSeasonPack('Jujutsu Kaisen Season 2 Vol. 7', 2, 1), false);
+  assert.equal(titleContainsSeasonPack('Jujutsu Kaisen Season 2 Volume 6', 2, 1), false);
 });
 
 test('episode range match is exact only when it covers the requested episode', () => {
