@@ -62,3 +62,67 @@ test('health evidence never caches non-verified decisions and is episode scoped'
   assert.equal(calls, 2);
   clearHealthEvidenceCache();
 });
+
+test('adaptive runtime budgets share evidence while decision policy changes do not', async () => {
+  clearHealthEvidenceCache();
+  const base = {
+    nzbPayload: '<nzb><file subject="Stable evidence"><segments /></file></nzb>',
+    requestedEpisode: { season: 2, episode: 1 },
+    isSeasonPack: false,
+  };
+  const firstKey = buildExactEvidenceKey({
+    ...base,
+    triageConfig: {
+      maxDecodedBytes: 32768,
+      statSampleCount: 0,
+      archiveSampleCount: 1,
+      healthCheckTimeoutMs: 18505,
+      nntpMaxConnections: 4,
+      maxParallelNzbs: 2,
+      reuseNntpPool: true,
+      nntpKeepAliveMs: 0,
+      nntpConfig: {
+        host: 'news.example.test', port: 563, user: 'tester', pass: 'old-secret', useTLS: true,
+      },
+    },
+  });
+  const retryKey = buildExactEvidenceKey({
+    ...base,
+    triageConfig: {
+      maxDecodedBytes: 32768,
+      statSampleCount: 0,
+      archiveSampleCount: 1,
+      healthCheckTimeoutMs: 22708,
+      nntpMaxConnections: 12,
+      maxParallelNzbs: 6,
+      reuseNntpPool: false,
+      nntpKeepAliveMs: 120000,
+      nntpConfig: {
+        host: 'news.example.test', port: 563, user: 'tester', pass: 'new-secret', useTLS: true,
+      },
+    },
+  });
+  const changedPolicyKey = buildExactEvidenceKey({
+    ...base,
+    triageConfig: {
+      maxDecodedBytes: 65536,
+      statSampleCount: 0,
+      archiveSampleCount: 1,
+      healthCheckTimeoutMs: 22708,
+      nntpConfig: { host: 'news.example.test', port: 563, user: 'tester', useTLS: true },
+    },
+  });
+
+  assert.equal(retryKey, firstKey);
+  assert.notEqual(changedPolicyKey, firstKey);
+
+  let calls = 0;
+  const task = async () => {
+    calls += 1;
+    return { status: 'verified', blockers: [] };
+  };
+  assert.equal((await runWithExactHealthEvidence(firstKey, task)).source, 'live');
+  assert.equal((await runWithExactHealthEvidence(retryKey, task)).source, 'cache');
+  assert.equal(calls, 1);
+  clearHealthEvidenceCache();
+});

@@ -1,8 +1,19 @@
 const crypto = require('crypto');
 
-const POLICY_VERSION = 'exact-payload-health-v1';
+const POLICY_VERSION = 'exact-payload-health-v2';
 const DEFAULT_TTL_MS = 30 * 60 * 1000;
 const DEFAULT_MAX_ENTRIES = 5000;
+
+// These options affect how quickly or concurrently triage runs, but cannot
+// change the meaning of a successful health decision. Including them in the
+// evidence key made the adaptive per-request timeout defeat cache reuse.
+const OPERATIONAL_TRIAGE_KEYS = new Set([
+  'healthCheckTimeoutMs',
+  'nntpMaxConnections',
+  'maxParallelNzbs',
+  'reuseNntpPool',
+  'nntpKeepAliveMs',
+]);
 
 const evidenceCache = new Map();
 const evidenceFlights = new Map();
@@ -44,12 +55,30 @@ function cloneDecision(decision) {
   return decision ? JSON.parse(JSON.stringify(decision)) : decision;
 }
 
+function normalizeEvidencePolicyConfig(triageConfig) {
+  if (!triageConfig || typeof triageConfig !== 'object' || Array.isArray(triageConfig)) return {};
+  const normalized = {};
+  Object.entries(triageConfig).forEach(([key, value]) => {
+    if (!OPERATIONAL_TRIAGE_KEYS.has(key)) normalized[key] = value;
+  });
+
+  // A credential rotation does not change article availability for the same
+  // provider account, and secrets should never influence cache identity. Keep
+  // the provider/account identity while omitting the password itself.
+  if (normalized.nntpConfig && typeof normalized.nntpConfig === 'object') {
+    normalized.nntpConfig = { ...normalized.nntpConfig };
+    delete normalized.nntpConfig.pass;
+    delete normalized.nntpConfig.password;
+  }
+  return normalized;
+}
+
 function buildExactEvidenceKey({ nzbPayload, triageConfig, requestedEpisode, isSeasonPack }) {
   if (typeof nzbPayload !== 'string' || nzbPayload.length === 0) return null;
   const payloadHash = crypto.createHash('sha256').update(nzbPayload, 'utf8').digest('hex');
   const policyHash = crypto.createHash('sha256').update(stableSerialize({
     version: POLICY_VERSION,
-    triageConfig: triageConfig || {},
+    triageConfig: normalizeEvidencePolicyConfig(triageConfig),
     requestedEpisode: requestedEpisode || null,
     isSeasonPack: Boolean(isSeasonPack),
   })).digest('hex');
