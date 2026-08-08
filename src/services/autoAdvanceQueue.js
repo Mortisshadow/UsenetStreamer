@@ -359,7 +359,10 @@ function createSession(contentKey, candidates, options = {}) {
 function getSession(contentKey) {
   const session = activeSessions.get(contentKey);
   if (!session) return null;
-  if (session.closed || (Date.now() - session.createdAt > SESSION_TTL_MS)) {
+  const expired = Date.now() - session.createdAt > SESSION_TTL_MS;
+  // Match the janitor's safety rule: never close a session while a stream is
+  // actively waiting on it, even if a concurrent lookup observes TTL expiry.
+  if (session.closed || (expired && session.activeWaiters === 0)) {
     session.close();
     activeSessions.delete(contentKey);
     return null;

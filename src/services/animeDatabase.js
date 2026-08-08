@@ -5,6 +5,8 @@ const fsp = require('fs/promises');
 const path = require('path');
 const axios = require('axios');
 const https = require('https');
+const crypto = require('node:crypto');
+const { RESPONSE_LIMITS, axiosResponseLimit } = require('../utils/responseLimits');
 
 const DATA_DIR = path.join(__dirname, '..', '..', 'cache', 'anime_db');
 
@@ -12,16 +14,19 @@ const httpsAgent = new https.Agent({ keepAlive: false });
 
 const DATA_SOURCES = {
   fribb: {
+    kind: 'fribb',
     url: 'https://raw.githubusercontent.com/Fribb/anime-lists/refs/heads/master/anime-list-full.json',
     file: path.join(DATA_DIR, 'fribb-mappings.json'),
     refreshMs: 24 * 60 * 60 * 1000, // 1 day
   },
   kitsuImdb: {
+    kind: 'kitsuImdb',
     url: 'https://raw.githubusercontent.com/TheBeastLT/stremio-kitsu-anime/master/static/data/imdb_mapping.json',
     file: path.join(DATA_DIR, 'kitsu-imdb-mapping.json'),
     refreshMs: 24 * 60 * 60 * 1000,
   },
   manami: {
+    kind: 'manami',
     url: 'https://github.com/manami-project/anime-offline-database/releases/download/latest/anime-offline-database-minified.json',
     file: path.join(DATA_DIR, 'manami-db.json'),
     refreshMs: 7 * 24 * 60 * 60 * 1000, // 7 days
@@ -67,6 +72,7 @@ let manamiByAnilist = new Map();
 let initialized = false;
 let initPromise = null;
 let lastLoadTimestamps = {};
+let refreshScheduled = false;
 
 // --- Public API ---
 
@@ -318,7 +324,11 @@ function getSearchableTitles(titles, limit = 3) {
 async function ensureInitialized() {
   if (initialized) return;
   if (initPromise) return initPromise;
-  initPromise = initialize();
+  initPromise = initialize().finally(() => {
+    // A rejected initialization must be retryable instead of poisoning the
+    // process for its entire lifetime.
+    initPromise = null;
+  });
   return initPromise;
 }
 
@@ -345,7 +355,6 @@ async function initialize() {
   await loadManamiDb();
 
   initialized = true;
-  initPromise = null;
   console.log(`[ANIME-DB] Initialized in ${Date.now() - startTs}ms`, {
     fribbKitsu: fribbByKitsu.size,
     fribbMal: fribbByMal.size,
@@ -372,10 +381,21 @@ async function refreshDataFile(source) {
       responseType: 'arraybuffer',
       timeout: 60000,
       headers: { 'Accept-Encoding': 'gzip, deflate' },
+      ...axiosResponseLimit(RESPONSE_LIMITS.animeDatabase),
     });
-    await fsp.writeFile(source.file, response.data);
+    const payload = Buffer.isBuffer(response.data) ? response.data : Buffer.from(response.data);
+    validateAnimePayload(source, payload);
+    const tempFile = `${source.file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+    try {
+      await fsp.writeFile(tempFile, payload, { flag: 'wx' });
+      await fsp.rename(tempFile, source.file);
+    } finally {
+      await fsp.unlink(tempFile).catch((error) => {
+        if (error?.code !== 'ENOENT') console.warn(`[ANIME-DB] Failed to remove temporary file: ${error.message}`);
+      });
+    }
     lastLoadTimestamps[source.file] = Date.now();
-    console.log(`[ANIME-DB] Downloaded ${path.basename(source.file)} (${(response.data.length / 1024 / 1024).toFixed(1)}MB)`);
+    console.log(`[ANIME-DB] Downloaded ${path.basename(source.file)} (${(payload.length / 1024 / 1024).toFixed(1)}MB)`);
   } catch (err) {
     // If file exists on disk already, use it even if download failed
     if (fs.existsSync(source.file)) {
@@ -384,6 +404,18 @@ async function refreshDataFile(source) {
       throw new Error(`[ANIME-DB] Failed to download ${path.basename(source.file)}: ${err.message}`);
     }
   }
+}
+
+function validateAnimePayload(source, payload) {
+  let parsed;
+  try { parsed = JSON.parse(payload.toString('utf8')); }
+  catch (error) { throw new Error(`Invalid JSON for ${source.kind || path.basename(source.file)}: ${error.message}`); }
+  if (source.kind === 'fribb' && (!Array.isArray(parsed) || parsed.length === 0)) throw new Error('Fribb data must be a non-empty array');
+  if (source.kind === 'kitsuImdb' && (!parsed || typeof parsed !== 'object' || Object.keys(parsed).length === 0)) {
+    throw new Error('Kitsu-IMDB data must be a non-empty object or array');
+  }
+  if (source.kind === 'manami' && (!Array.isArray(parsed?.data) || parsed.data.length === 0)) throw new Error('Manami data.data must be a non-empty array');
+  return parsed;
 }
 
 async function shouldDownload(source) {
@@ -397,6 +429,8 @@ async function shouldDownload(source) {
 }
 
 function scheduleRefresh() {
+  if (refreshScheduled) return;
+  refreshScheduled = true;
   // Refresh every 24 hours (check all sources)
   const REFRESH_INTERVAL = 24 * 60 * 60 * 1000;
   setInterval(async () => {

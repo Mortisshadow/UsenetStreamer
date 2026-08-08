@@ -26,6 +26,7 @@
 //    handling can't double-proxy or bypass our agent.
 
 const axios = require('axios');
+const crypto = require('crypto');
 const { HttpProxyAgent } = require('http-proxy-agent');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 const { SocksProxyAgent } = require('socks-proxy-agent');
@@ -40,10 +41,59 @@ const SOCKS_SCHEMES = new Set(['socks', 'socks4', 'socks4a', 'socks5', 'socks5h'
 // and is never a real public indexer, so we connect direct (bypass).
 const INTERNAL_SUFFIXES = ['.local', '.localhost', '.internal', '.lan', '.home', '.home.arpa', '.corp', '.intranet', '.docker'];
 
-// Cache agents per proxy URL — agents are reusable across targets of the same
-// scheme family, so we don't rebuild per request. Keyed by the raw (trimmed)
-// proxy URL; a config change yields a new key naturally.
+// Cache agents per proxy identity — agents are reusable across targets of the
+// same scheme family. The key is a one-way digest so proxy credentials are not
+// retained a second time as an inspectable Map/debug identity.
 const agentCache = new Map();
+const MAX_AGENT_CACHE_ENTRIES = (() => {
+  const raw = Number(process.env.INDEXER_PROXY_AGENT_CACHE_MAX_ENTRIES);
+  // 20 direct Newznab slots plus the manager fit without evicting an agent
+  // that may still be serving an active request.
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 32;
+})();
+
+function proxyCacheKey(proxyUrl) {
+  return crypto.createHash('sha256').update(proxyUrl).digest('hex');
+}
+
+function destroyAgents(agents) {
+  const unique = new Set([agents?.httpAgent, agents?.httpsAgent].filter(Boolean));
+  for (const agent of unique) {
+    try { agent.destroy?.(); } catch { /* best-effort socket cleanup */ }
+  }
+}
+
+function evictProxyAgentCacheEntry(key) {
+  const entry = agentCache.get(key);
+  if (!entry) return;
+  agentCache.delete(key);
+  destroyAgents(entry.agents);
+}
+
+function enforceProxyAgentCacheLimit() {
+  while (agentCache.size > MAX_AGENT_CACHE_ENTRIES) {
+    evictProxyAgentCacheEntry(agentCache.keys().next().value);
+  }
+}
+
+// Call on a proxy configuration reload. Agents for removed/changed proxy URLs
+// are destroyed immediately instead of waiting for LRU pressure.
+function pruneProxyAgentCache(activeProxyUrls = []) {
+  const activeKeys = new Set(activeProxyUrls
+    .filter((value) => typeof value === 'string' && value.trim())
+    .map((value) => proxyCacheKey(value.trim())));
+  for (const key of Array.from(agentCache.keys())) {
+    if (!activeKeys.has(key)) evictProxyAgentCacheEntry(key);
+  }
+}
+
+function clearProxyAgentCache() {
+  for (const key of Array.from(agentCache.keys())) evictProxyAgentCacheEntry(key);
+}
+
+function getProxyAgentCacheStats() {
+  return { entries: agentCache.size, maxEntries: MAX_AGENT_CACHE_ENTRIES };
+}
 
 // Strip any credentials from a proxy URL for safe logging/echoing.
 function maskProxyUrl(raw) {
@@ -127,7 +177,14 @@ function hostFromUrl(targetUrl) {
 // Build (and memoize) the {httpAgent, httpsAgent} pair for a proxy URL.
 // Throws (fail-closed) on an unparseable URL or unsupported scheme.
 function buildAgentsForProxy(proxyUrl) {
-  if (agentCache.has(proxyUrl)) return agentCache.get(proxyUrl);
+  const cacheKey = proxyCacheKey(proxyUrl);
+  const cached = agentCache.get(cacheKey);
+  if (cached) {
+    // Touch insertion order for LRU eviction.
+    agentCache.delete(cacheKey);
+    agentCache.set(cacheKey, cached);
+    return cached.agents;
+  }
 
   let scheme;
   try {
@@ -153,7 +210,8 @@ function buildAgentsForProxy(proxyUrl) {
     throw new Error(`[INDEXER PROXY] Unsupported proxy scheme "${scheme}://" (use http://, https://, or socks5://)`);
   }
 
-  agentCache.set(proxyUrl, agents);
+  agentCache.set(cacheKey, { agents });
+  enforceProxyAgentCacheLimit();
   return agents;
 }
 
@@ -197,14 +255,26 @@ function buildProxyAgents(proxyUrl, targetUrl) {
  * @returns {Promise<import('axios').AxiosResponse>} the final (non-3xx) response
  */
 async function proxiedGet(url, proxyUrl, axiosConfig = {}) {
+  const { validateHop, ...requestConfig } = axiosConfig;
   const callerValidate = typeof axiosConfig.validateStatus === 'function'
     ? axiosConfig.validateStatus
     : (s) => s >= 200 && s < 300;
   let currentUrl = url;
+  let previousUrl = null;
+  let hopHeaders = { ...(requestConfig.headers || {}) };
   for (let hop = 0; hop <= MAX_PROXY_REDIRECTS; hop += 1) {
+    if (typeof validateHop === 'function') {
+      const validation = await validateHop(currentUrl, previousUrl);
+      if (validation?.stripSensitiveHeaders) {
+        hopHeaders = Object.fromEntries(Object.entries(hopHeaders).filter(([name]) => ![
+          'authorization', 'cookie', 'proxy-authorization', 'x-api-key', 'x-auth-token',
+        ].includes(String(name).toLowerCase())));
+      }
+    }
     const agents = buildProxyAgents(proxyUrl, currentUrl); // throws fail-closed on a bad proxy URL
     const resp = await axios.get(currentUrl, {
-      ...axiosConfig,
+      ...requestConfig,
+      headers: hopHeaders,
       maxRedirects: 0, // we follow manually so the proxy is re-evaluated per hop
       proxy: false,
       ...(agents || {}),
@@ -214,7 +284,13 @@ async function proxiedGet(url, proxyUrl, axiosConfig = {}) {
     if (resp.status >= 300 && resp.status < 400) {
       const loc = resp.headers && (resp.headers.location || resp.headers.Location);
       if (!loc) return resp; // redirect with no target — hand back as-is
-      currentUrl = new URL(loc, currentUrl).toString(); // resolve relative redirects
+      previousUrl = currentUrl;
+      try { currentUrl = new URL(loc, currentUrl).toString(); } // resolve relative redirects
+      catch (_) {
+        const error = new Error('Invalid download redirect URL');
+        error.code = 'OUTBOUND_URL_BLOCKED';
+        throw error;
+      }
       continue;
     }
     return resp;
@@ -230,4 +306,7 @@ module.exports = {
   maskProxyUrl,
   proxyUrlHasCredentials,
   isPrivateOrLocalHost,
+  pruneProxyAgentCache,
+  clearProxyAgentCache,
+  getProxyAgentCacheStats,
 };

@@ -5,6 +5,7 @@
 const crypto = require('node:crypto');
 const { compile: compileSel, evaluate: evaluateSel } = require('./sel');
 const { BUILTIN_FUNCTIONS } = require('./selFunctions');
+const { validateSafeRegex } = require('../../utils/safeRegex');
 
 const MAX_RULES_PER_KIND = 500;
 const REGEX_BUDGET_MS = 500;
@@ -74,7 +75,11 @@ function compileRules(input) {
   if (compileCache.has(key)) return compileCache.get(key);
   const errors = [];
   const regex = rules.rankedRegexPatterns.map((rule) => {
-    try { return { ...rule, compiled: new RegExp(rule.pattern, rule.flags || 'i') }; }
+    try {
+      const validationError = validateSafeRegex(rule.pattern, rule.flags || 'i');
+      if (validationError) throw new Error(validationError.message);
+      return { ...rule, compiled: new RegExp(rule.pattern, rule.flags || 'i') };
+    }
     catch (error) { errors.push({ kind: 'regex', ruleId: rule.id, ruleName: rule.name, message: error.message }); return rule; }
   });
   const sel = rules.rankedStreamExpressions.map((rule) => {

@@ -3,6 +3,7 @@ const axios = require('axios');
 const { redactSensitiveString } = require('../utils/logSanitizer');
 const { getPublishMetadataFromResult, areReleasesWithinDays } = require('../utils/publishInfo');
 const { buildProxyAgents } = require('../utils/proxyAgent');
+const { RESPONSE_LIMITS, axiosResponseLimit } = require('../utils/responseLimits');
 
 // Configuration (runtime reloadable)
 let INDEXER_MANAGER = 'prowlarr';
@@ -45,6 +46,12 @@ reloadConfig();
 // manager-origin downloads (which don't map to a Direct Newznab slug).
 function getManagerProxy() {
   return INDEXER_MANAGER_PROXY;
+}
+
+function getManagerDownloadAllowedHosts() {
+  if (!INDEXER_MANAGER_BASE_URL) return [];
+  try { return [new URL(INDEXER_MANAGER_BASE_URL).hostname]; }
+  catch (_) { return []; }
 }
 const PROWLARR_SEARCH_LIMIT = 1000;
 const TRIAGE_DECISION_SHARING_WINDOW_DAYS = 14;
@@ -107,6 +114,7 @@ async function executeProwlarrSearch(plan) {
     headers: { 'X-Api-Key': INDEXER_MANAGER_API_KEY },
     timeout: 60000,
     proxy: false,
+    ...axiosResponseLimit(RESPONSE_LIMITS.managerSearch),
     ...(buildProxyAgents(INDEXER_MANAGER_PROXY, fullUrl) || {}),
   });
   return Array.isArray(response.data) ? response.data : [];
@@ -395,6 +403,7 @@ async function executeNzbhydraSearch(plan) {
     params,
     timeout: 60000,
     proxy: false,
+    ...axiosResponseLimit(RESPONSE_LIMITS.managerSearch),
     ...(buildProxyAgents(INDEXER_MANAGER_PROXY, url) || {}),
   });
   // NZBHydra returns HTTP 200 with a newznab <error> body on failures (e.g. a
@@ -466,5 +475,6 @@ module.exports = {
   buildProwlarrSearchParams,
   buildHydraSearchParams,
   getManagerProxy,
+  getManagerDownloadAllowedHosts,
   reloadConfig,
 };

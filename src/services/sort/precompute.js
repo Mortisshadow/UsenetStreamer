@@ -8,6 +8,7 @@
 //   _keywordMatched: boolean
 
 const DEFAULT_MATCH_FIELDS = ['title', 'normalizedTitle', 'group', 'releaseGroup', 'indexer'];
+const { validateSafeRegex } = require('../../utils/safeRegex');
 
 function getMatchableStrings(stream, extraFields = []) {
   const out = [];
@@ -21,7 +22,9 @@ function getMatchableStrings(stream, extraFields = []) {
 
 function safeRegex(pattern, flags) {
   try {
-    return new RegExp(pattern, flags);
+    const statelessFlags = String(flags || '').replace(/[gy]/gi, '');
+    if (validateSafeRegex(pattern, statelessFlags)) return null;
+    return new RegExp(pattern, statelessFlags);
   } catch (_) {
     return null;
   }
@@ -107,6 +110,7 @@ function buildKeywordRegex(keywords) {
 
 function matchesAny(targets, pattern) {
   for (const target of targets) {
+    pattern.lastIndex = 0;
     if (pattern.test(target)) return true;
   }
   return false;

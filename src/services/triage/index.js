@@ -40,7 +40,7 @@ const DEFAULT_OPTIONS = {
 };
 
 let sharedNntpPoolRecord = null;
-let sharedNntpPoolBuildPromise = null;
+let sharedNntpPoolBuildRecord = null;
 let currentMetrics = null;
 const poolStats = {
   created: 0,
@@ -117,16 +117,78 @@ async function closePool(pool, reason) {
 }
 
 function getInFlightPoolBuild() {
-  return sharedNntpPoolBuildPromise;
+  return sharedNntpPoolBuildRecord;
 }
 
-function setInFlightPoolBuild(promise) {
-  sharedNntpPoolBuildPromise = promise;
+function setInFlightPoolBuild(key, promise) {
+  sharedNntpPoolBuildRecord = { key, promise };
 }
 
 function clearInFlightPoolBuild(promise) {
-  if (sharedNntpPoolBuildPromise === promise) {
-    sharedNntpPoolBuildPromise = null;
+  if (sharedNntpPoolBuildRecord?.promise === promise) {
+    sharedNntpPoolBuildRecord = null;
+  }
+}
+
+async function retireSharedPoolRecord(record, reason) {
+  if (!record?.pool || record.retired) return;
+  record.retired = true;
+  record.retireReason = reason;
+  if ((record.users ?? 0) === 0) {
+    const pool = record.pool;
+    record.pool = null;
+    await closePool(pool, reason);
+  }
+}
+
+async function releaseSharedPoolLease(record) {
+  if (!record) return;
+  record.users = Math.max(0, (record.users ?? 1) - 1);
+  if (record.retired && record.users === 0 && record.pool) {
+    const pool = record.pool;
+    record.pool = null;
+    await closePool(pool, record.retireReason || 'retired');
+  }
+}
+
+async function ensureSharedNntpPool(config, poolKey, creationReason) {
+  while (true) {
+    if (sharedNntpPoolRecord?.key === poolKey && sharedNntpPoolRecord?.pool && !sharedNntpPoolRecord.retired) {
+      return sharedNntpPoolRecord;
+    }
+
+    const existingBuild = getInFlightPoolBuild();
+    if (existingBuild) {
+      try {
+        await existingBuild.promise;
+      } catch (err) {
+        // A caller waiting on its own key should see the connection failure.
+        // A different configuration must still get a chance to build.
+        if (existingBuild.key === poolKey) throw err;
+      }
+      continue;
+    }
+
+    const buildPromise = (async () => {
+      const previous = sharedNntpPoolRecord;
+      if (previous && previous.key !== poolKey) {
+        sharedNntpPoolRecord = null;
+        await retireSharedPoolRecord(previous, 'configuration-changed');
+      }
+      const freshPool = await createNntpPool(config.nntpConfig, config.nntpMaxConnections ?? 1, {
+        keepAliveMs: Number.isFinite(config.nntpKeepAliveMs) ? config.nntpKeepAliveMs : 0,
+      });
+      const record = { key: poolKey, pool: freshPool, users: 0, retired: false };
+      sharedNntpPoolRecord = record;
+      recordPoolCreate(freshPool, { reason: creationReason });
+      return record;
+    })();
+    setInFlightPoolBuild(poolKey, buildPromise);
+    try {
+      return await buildPromise;
+    } finally {
+      clearInFlightPoolBuild(buildPromise);
+    }
   }
 }
 
@@ -138,25 +200,6 @@ async function preWarmNntpPool(options = {}) {
   const desiredConnections = config.nntpMaxConnections ?? 1;
   const keepAliveMs = Number.isFinite(config.nntpKeepAliveMs) ? config.nntpKeepAliveMs : 0;
   const poolKey = buildPoolKey(config.nntpConfig, desiredConnections, keepAliveMs);
-
-  // If there's already a build in progress, await it instead of starting a second one
-  const POOL_BUILD_TIMEOUT_MS = 30000;
-  const existingBuild = getInFlightPoolBuild();
-  if (existingBuild) {
-    console.log('[NZB TRIAGE] Waiting for existing in-flight pool build (timeout: 30s)...');
-    const buildStart = Date.now();
-    await Promise.race([
-      existingBuild,
-      new Promise((resolve) => setTimeout(resolve, POOL_BUILD_TIMEOUT_MS)),
-    ]).catch(() => {});
-    if (getInFlightPoolBuild() === existingBuild) {
-      console.warn(`[NZB TRIAGE] In-flight pool build timed out after ${Date.now() - buildStart} ms — clearing stuck promise`);
-      clearInFlightPoolBuild(existingBuild);
-    } else {
-      console.log(`[NZB TRIAGE] In-flight pool build completed in ${Date.now() - buildStart} ms`);
-    }
-    return;
-  }
 
   // If pool exists and matches config, just touch it
   if (sharedNntpPoolRecord?.key === poolKey && sharedNntpPoolRecord?.pool) {
@@ -170,30 +213,17 @@ async function preWarmNntpPool(options = {}) {
     }
   }
 
-  const buildPromise = (async () => {
-    try {
-      const freshPool = await createNntpPool(config.nntpConfig, desiredConnections, { keepAliveMs });
-      if (sharedNntpPoolRecord?.pool) {
-        try {
-          await closePool(sharedNntpPoolRecord.pool, 'prewarm-replaced');
-        } catch (closeErr) {
-          console.warn('[NZB TRIAGE] Failed to close previous pre-warmed NNTP pool', closeErr?.message || closeErr);
-        }
-      }
-      sharedNntpPoolRecord = { key: poolKey, pool: freshPool, keepAliveMs };
-      recordPoolCreate(freshPool, { reason: 'prewarm' });
-    } catch (err) {
-      console.warn('[NZB TRIAGE] Failed to pre-warm NNTP pool', {
-        message: err?.message,
-        code: err?.code,
-        name: err?.name,
-      });
-    }
-  })();
-
-  setInFlightPoolBuild(buildPromise);
-  await buildPromise;
-  clearInFlightPoolBuild(buildPromise);
+  try {
+    const record = await ensureSharedNntpPool(config, poolKey, 'prewarm');
+    record.pool?.touch?.();
+  } catch (err) {
+    console.warn('[NZB TRIAGE] Failed to pre-warm NNTP pool', {
+      message: err?.message,
+      code: err?.code,
+      name: err?.name,
+    });
+    throw err;
+  }
 }
 
 async function triageNzbs(nzbStrings, options = {}) {
@@ -226,6 +256,9 @@ async function triageNzbs(nzbStrings, options = {}) {
   let nntpError = null;
   let nntpPool = null;
   let shouldClosePool = false;
+  let sharedPoolLease = null;
+  let analysisPromise = null;
+  let analysisSettled = false;
   if (config.nntpConfig && NNTP) {
     const desiredConnections = config.nntpMaxConnections ?? 1;
     const keepAliveMs = Number.isFinite(config.nntpKeepAliveMs) ? config.nntpKeepAliveMs : 0;
@@ -233,11 +266,14 @@ async function triageNzbs(nzbStrings, options = {}) {
     const canReuseSharedPool = config.reuseNntpPool
       && !sharedPoolStale
       && sharedNntpPoolRecord?.key === poolKey
-      && sharedNntpPoolRecord?.pool;
+      && sharedNntpPoolRecord?.pool
+      && !sharedNntpPoolRecord.retired;
 
     let needsFreshPool = false;
     if (canReuseSharedPool) {
-      nntpPool = sharedNntpPoolRecord.pool;
+      sharedPoolLease = sharedNntpPoolRecord;
+      sharedPoolLease.users = (sharedPoolLease.users ?? 0) + 1;
+      nntpPool = sharedPoolLease.pool;
       if (typeof nntpPool?.touch === 'function') {
         nntpPool.touch();
       }
@@ -250,27 +286,18 @@ async function triageNzbs(nzbStrings, options = {}) {
       console.log('[NZB TRIAGE] Creating fresh NNTP pool...');
       const poolBuildStart = Date.now();
       const hadSharedPool = Boolean(sharedNntpPoolRecord?.pool);
-      if (config.reuseNntpPool && hadSharedPool && !getInFlightPoolBuild()) {
+      if (config.reuseNntpPool && sharedPoolStale && hadSharedPool) {
         await closeSharedNntpPool(sharedPoolStale ? 'stale' : 'replaced');
       }
       try {
         if (config.reuseNntpPool) {
-          let buildPromise = getInFlightPoolBuild();
-          if (!buildPromise) {
-            buildPromise = (async () => {
-              const freshPool = await createNntpPool(config.nntpConfig, desiredConnections, { keepAliveMs });
-              const creationReason = sharedPoolStale
-                ? 'stale-refresh'
-                : (hadSharedPool ? 'refresh' : 'bootstrap');
-              sharedNntpPoolRecord = { key: poolKey, pool: freshPool, keepAliveMs };
-              recordPoolCreate(freshPool, { reason: creationReason });
-              return freshPool;
-            })();
-            setInFlightPoolBuild(buildPromise);
-          }
           console.log('[NZB TRIAGE] Waiting for pool build promise...');
-          nntpPool = await buildPromise;
-          clearInFlightPoolBuild(buildPromise);
+          const creationReason = sharedPoolStale
+            ? 'stale-refresh'
+            : (hadSharedPool ? 'refresh' : 'bootstrap');
+          sharedPoolLease = await ensureSharedNntpPool(config, poolKey, creationReason);
+          sharedPoolLease.users = (sharedPoolLease.users ?? 0) + 1;
+          nntpPool = sharedPoolLease.pool;
           console.log(`[NZB TRIAGE] Pool build completed in ${Date.now() - poolBuildStart} ms (idle=${nntpPool?.getIdleCount?.() ?? '?'})`);
         } else {
           const freshPool = await createNntpPool(config.nntpConfig, desiredConnections, { keepAliveMs });
@@ -279,9 +306,6 @@ async function triageNzbs(nzbStrings, options = {}) {
           recordPoolCreate(freshPool, { reason: 'one-shot' });
         }
       } catch (err) {
-        if (config.reuseNntpPool) {
-          clearInFlightPoolBuild(getInFlightPoolBuild());
-        }
         console.warn('[NZB TRIAGE] Failed to create NNTP pool', {
           message: err?.message,
           code: err?.code,
@@ -296,34 +320,53 @@ async function triageNzbs(nzbStrings, options = {}) {
     nntpError = new Error('nntp module unavailable');
   }
 
-  const parallelLimit = Math.max(1, Math.min(config.maxParallelNzbs ?? Number.POSITIVE_INFINITY, nzbStrings.length));
-  const results = await runWithDeadline(
-    () => analyzeWithConcurrency({
-      nzbStrings,
-      parallelLimit,
-      config,
-      nntpPool,
-      nntpError,
-    }),
-    healthTimeoutMs,
-  );
-  results.sort((a, b) => a.index - b.index);
-  for (const { decision } of results) decisions.push(decision);
+  try {
+    const parallelLimit = Math.max(1, Math.min(config.maxParallelNzbs ?? Number.POSITIVE_INFINITY, nzbStrings.length));
+    const results = await runWithDeadline(
+      () => {
+        analysisPromise = analyzeWithConcurrency({
+          nzbStrings,
+          parallelLimit,
+          config,
+          nntpPool,
+          nntpError,
+        });
+        analysisPromise.then(
+          () => { analysisSettled = true; },
+          () => { analysisSettled = true; },
+        );
+        return analysisPromise;
+      },
+      healthTimeoutMs,
+    );
+    results.sort((a, b) => a.index - b.index);
+    for (const { decision } of results) decisions.push(decision);
 
-  if (shouldClosePool && nntpPool) await closePool(nntpPool, 'one-shot');
-  else if (config.reuseNntpPool && nntpPool && typeof nntpPool.touch === 'function') {
-    nntpPool.touch();
+    const elapsedMs = Date.now() - start;
+    const accepted = decisions.filter((x) => x.decision === 'accept').length;
+    const rejected = decisions.filter((x) => x.decision === 'reject').length;
+    const blockerCounts = buildFlagCounts(decisions, 'blockers');
+    const warningCounts = buildFlagCounts(decisions, 'warnings');
+    const metrics = currentMetrics;
+    if (metrics) metrics.poolTotals = { ...poolStats };
+    return { decisions, accepted, rejected, elapsedMs, blockerCounts, warningCounts, metrics };
+  } finally {
+    const releaseResources = async () => {
+      if (shouldClosePool && nntpPool) await closePool(nntpPool, 'one-shot');
+      else if (sharedPoolLease) {
+        nntpPool?.touch?.();
+        await releaseSharedPoolLease(sharedPoolLease);
+      }
+    };
+    if (analysisPromise && !analysisSettled) {
+      // The response deadline must not return a still-in-use client to the pool.
+      // Per-command timeouts will finish the operation; release its lease then.
+      analysisPromise.then(releaseResources, releaseResources).catch(() => {});
+    } else {
+      await releaseResources();
+    }
+    currentMetrics = null;
   }
-
-  const elapsedMs = Date.now() - start;
-  const accepted = decisions.filter((x) => x.decision === 'accept').length;
-  const rejected = decisions.filter((x) => x.decision === 'reject').length;
-  const blockerCounts = buildFlagCounts(decisions, 'blockers');
-  const warningCounts = buildFlagCounts(decisions, 'warnings');
-  const metrics = currentMetrics;
-  if (metrics) metrics.poolTotals = { ...poolStats };
-  currentMetrics = null;
-  return { decisions, accepted, rejected, elapsedMs, blockerCounts, warningCounts, metrics };
 }
 
 async function analyzeSingleNzb(raw, ctx) {
@@ -2829,13 +2872,26 @@ function fetchSegmentBody(pool, segmentId) {
     });
 }
 
-function fetchSegmentBodyWithClient(client, segmentId) {
+function fetchSegmentBodyWithClient(client, segmentId, timeoutMs = 5000) {
   return new Promise((resolve, reject) => {
-    client.body(`<${segmentId}>`, (err, _articleNumber, _messageId, bodyBuffer) => {
+    let completed = false;
+    const timer = setTimeout(() => {
+      if (completed) return;
+      completed = true;
+      const error = new Error(`BODY timed out after ${timeoutMs}ms`);
+      error.code = 'BODY_TIMEOUT';
+      error.dropClient = true;
+      reject(error);
+    }, timeoutMs);
+    const onBody = (err, _articleNumber, _messageId, bodyBuffer) => {
+      if (completed) return;
+      completed = true;
+      clearTimeout(timer);
       if (err) {
         const error = new Error(err.message || 'BODY failed');
-        error.code = err.code ?? 'BODY_ERROR';
-        if (error.code === 430) error.code = 'BODY_MISSING';
+        error.code = (err.code === 430 || String(err.message || '').includes('430'))
+          ? 'BODY_MISSING'
+          : (err.code ?? 'BODY_ERROR');
         if (['ETIMEDOUT', 'ECONNRESET', 'ECONNABORTED', 'EPIPE'].includes(err.code)) {
           error.dropClient = true;
         }
@@ -2851,7 +2907,17 @@ function fetchSegmentBodyWithClient(client, segmentId) {
       }
 
       resolve(bodyBuffer);
-    });
+    };
+    try {
+      client.body(`<${segmentId}>`, onBody);
+    } catch (error) {
+      if (!completed) {
+        completed = true;
+        clearTimeout(timer);
+      }
+      error.dropClient = true;
+      reject(error);
+    }
   });
 }
 
@@ -2921,6 +2987,10 @@ async function createNntpPool(config, maxConnections, options = {}) {
     (async () => {
       try {
         const replacement = await createNntpClient(config);
+        if (closing) {
+          await closeNntpClient(replacement);
+          return;
+        }
         attachErrorHandler(replacement);
         allClients.add(replacement);
         if (waiters.length > 0) {
@@ -2966,35 +3036,42 @@ async function createNntpPool(config, maxConnections, options = {}) {
     const timer = setTimeout(async () => {
       noopTimers.delete(client);
       if (!isTriageActivityFresh()) return;
+      // Reserve the socket before issuing STAT. Leaving it in `idle` lets a
+      // concurrent acquire run a second NNTP command on the same connection.
+      const idleIndex = idle.indexOf(client);
+      if (idleIndex === -1) return;
+      idle.splice(idleIndex, 1);
+      touch();
       try {
         const statStart = Date.now();
         const keepAliveMessageId = buildKeepAliveMessageId();
-        await Promise.race([
-          new Promise((resolve, reject) => {
-            client.stat(keepAliveMessageId, (err) => {
-              if (err && err.code === 430) {
-                resolve(); // 430 = article not found, which is expected and means socket is alive
-              } else if (err) {
-                reject(err);
-              } else {
-                resolve();
-              }
-            });
-          }),
-          new Promise((_, reject) => setTimeout(() => reject(new Error('Keep-alive timeout')), KEEPALIVE_TIMEOUT_MS))
-        ]);
+        let keepAliveTimeout = null;
+        try {
+          await Promise.race([
+            new Promise((resolve, reject) => {
+              client.stat(keepAliveMessageId, (err) => {
+                if (err && err.code === 430) {
+                  resolve(); // 430 = article not found, which is expected and means socket is alive
+                } else if (err) {
+                  reject(err);
+                } else {
+                  resolve();
+                }
+              });
+            }),
+            new Promise((_, reject) => {
+              keepAliveTimeout = setTimeout(() => reject(new Error('Keep-alive timeout')), KEEPALIVE_TIMEOUT_MS);
+            }),
+          ]);
+        } finally {
+          if (keepAliveTimeout) clearTimeout(keepAliveTimeout);
+        }
         const elapsed = Date.now() - statStart;
         timingLog('nntp-keepalive:success', { durationMs: elapsed });
-        if (!closing && idle.includes(client) && isTriageActivityFresh()) {
-          scheduleKeepAlive(client);
-        }
+        releaseClient(client, false);
       } catch (err) {
         timingLog('nntp-keepalive:failed', { message: err?.message });
         console.warn('[NZB TRIAGE] Keep-alive failed, replacing client', err?.message || err);
-        const idleIndex = idle.indexOf(client);
-        if (idleIndex !== -1) {
-          idle.splice(idleIndex, 1);
-        }
         scheduleReplacement(client);
       }
     }, KEEPALIVE_INTERVAL_MS);
@@ -3011,6 +3088,7 @@ async function createNntpPool(config, maxConnections, options = {}) {
 
   const releaseClient = (client, drop) => {
     if (!client) return;
+    if (closing) return;
     if (drop) {
       cancelKeepAlive(client);
       scheduleReplacement(client);
@@ -3291,7 +3369,9 @@ async function createNntpClient({ host, port = 119, user, pass, useTLS = false, 
 
 function closeNntpClient(client) {
   return new Promise((resolve) => {
+    let fallbackTimer = null;
     const finalize = () => {
+      if (fallbackTimer) clearTimeout(fallbackTimer);
       client.removeListener('end', finalize);
       client.removeListener('close', finalize);
       client.removeListener('error', finalize);
@@ -3307,7 +3387,7 @@ function closeNntpClient(client) {
       finalize();
       return;
     }
-    setTimeout(finalize, 1000);
+    fallbackTimer = setTimeout(finalize, 1000);
   });
 }
 
@@ -3391,21 +3471,49 @@ function buildErrorDecision(err, nzbIndex) {
 }
 
 function buildPoolKey(config, connections, keepAliveMs = 0) {
+  // Include credentials so rotating a password can never reuse authenticated
+  // sockets from the old configuration. Only a one-way fingerprint is retained.
+  const credentialFingerprint = crypto
+    .createHash('sha256')
+    .update(`${config.user ?? ''}\0${config.pass ?? ''}`)
+    .digest('hex')
+    .slice(0, 24);
   return [
     config.host,
     config.port ?? 119,
-    config.user ?? '',
+    credentialFingerprint,
     config.useTLS ? 'tls' : 'plain',
+    config.connTimeout ?? DEFAULT_NNTP_CONN_TIMEOUT_MS,
     connections,
     keepAliveMs,
   ].join('|');
 }
 
 async function closeSharedNntpPool(reason = 'manual') {
-  if (sharedNntpPoolRecord?.pool) {
-    await closePool(sharedNntpPoolRecord.pool, reason);
-    sharedNntpPoolRecord = null;
+  const build = getInFlightPoolBuild();
+  if (build) await build.promise.catch(() => {});
+  const record = sharedNntpPoolRecord;
+  sharedNntpPoolRecord = null;
+  await retireSharedPoolRecord(record, reason);
+}
+
+async function reconfigureSharedNntpPool(options = null, reason = 'reconfigure') {
+  if (!options?.reuseNntpPool || !options?.nntpConfig || !NNTP) {
+    await closeSharedNntpPool(reason);
+    return;
   }
+  const config = { ...DEFAULT_OPTIONS, ...options };
+  const desiredConnections = config.nntpMaxConnections ?? 1;
+  const keepAliveMs = Number.isFinite(config.nntpKeepAliveMs) ? config.nntpKeepAliveMs : 0;
+  const desiredKey = buildPoolKey(config.nntpConfig, desiredConnections, keepAliveMs);
+  const build = getInFlightPoolBuild();
+  if (build?.key === desiredKey) await build.promise.catch(() => {});
+  if (sharedNntpPoolRecord?.key === desiredKey && sharedNntpPoolRecord?.pool && !sharedNntpPoolRecord.retired) {
+    sharedNntpPoolRecord.pool.touch?.();
+    return;
+  }
+  await closeSharedNntpPool(reason);
+  await preWarmNntpPool(config);
 }
 
 async function evictStaleSharedNntpPool(reason = 'stale-timeout') {
@@ -3440,5 +3548,11 @@ module.exports = {
   preWarmNntpPool,
   triageNzbs,
   closeSharedNntpPool,
+  reconfigureSharedNntpPool,
   evictStaleSharedNntpPool,
+  _test: {
+    buildPoolKey,
+    fetchSegmentBodyWithClient,
+    runWithClient,
+  },
 };

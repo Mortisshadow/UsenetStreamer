@@ -1,9 +1,13 @@
-const axios = require('axios');
 const { triageNzbs } = require('./index');
 const { getDefaultDownloadUserAgent } = require('../../utils/userAgent');
-const { getDownloadUserAgentForIndexer, getProxyForIndexer } = require('../newznab');
-const { getManagerProxy } = require('../indexer');
-const { proxiedGet } = require('../../utils/proxyAgent');
+const {
+  getDownloadUserAgentForIndexer,
+  getProxyForIndexer,
+  getDownloadAllowedHostsForIndexer,
+} = require('../newznab');
+const { getManagerProxy, getManagerDownloadAllowedHosts } = require('../indexer');
+const { safeBufferedGet } = require('../../utils/safeDownload');
+const { RESPONSE_LIMITS, axiosResponseLimit } = require('../../utils/responseLimits');
 const diskNzbCache = require('../../cache/diskNzbCache');
 const {
   buildExactEvidenceKey,
@@ -22,6 +26,68 @@ const TIMEOUT_ERROR_CODE = 'TRIAGE_TIMEOUT';
 // concurrently by separate background/blocking triage sessions.
 const serializedIndexerChains = new Map();
 const nzbDownloadFlights = new Map();
+const GLOBAL_DOWNLOAD_MAX_CONCURRENCY = (() => {
+  const raw = Number(process.env.NZB_DOWNLOAD_MAX_CONCURRENCY);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 16;
+})();
+const GLOBAL_DOWNLOAD_MAX_QUEUE = (() => {
+  const raw = Number(process.env.NZB_DOWNLOAD_MAX_QUEUE);
+  return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 256;
+})();
+const GLOBAL_DOWNLOAD_QUEUE_TIMEOUT_MS = (() => {
+  const raw = Number(process.env.NZB_DOWNLOAD_QUEUE_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw >= 1000 ? Math.floor(raw) : 15000;
+})();
+let activeNzbDownloads = 0;
+const nzbDownloadQueue = [];
+
+function acquireNzbDownloadSlot(deadlineTs = null) {
+  const remainingMs = Number.isFinite(deadlineTs) ? deadlineTs - Date.now() : Number.POSITIVE_INFINITY;
+  if (remainingMs <= 0) {
+    const error = new Error('Triage timed out before an NZB download slot became available');
+    error.code = TIMEOUT_ERROR_CODE;
+    return Promise.reject(error);
+  }
+  if (activeNzbDownloads < GLOBAL_DOWNLOAD_MAX_CONCURRENCY) {
+    activeNzbDownloads += 1;
+    return Promise.resolve(releaseNzbDownloadSlot);
+  }
+  if (nzbDownloadQueue.length >= GLOBAL_DOWNLOAD_MAX_QUEUE) {
+    const error = new Error('Global NZB download queue is full');
+    error.code = 'NZB_DOWNLOAD_QUEUE_FULL';
+    return Promise.reject(error);
+  }
+  return new Promise((resolve, reject) => {
+    const waiter = { resolve, reject, timer: null };
+    const timeoutMs = Math.min(GLOBAL_DOWNLOAD_QUEUE_TIMEOUT_MS, remainingMs);
+    const deadlineLimited = remainingMs <= GLOBAL_DOWNLOAD_QUEUE_TIMEOUT_MS;
+    waiter.timer = setTimeout(() => {
+      const index = nzbDownloadQueue.indexOf(waiter);
+      if (index >= 0) nzbDownloadQueue.splice(index, 1);
+      const error = new Error('Timed out waiting for a global NZB download slot');
+      error.code = deadlineLimited ? TIMEOUT_ERROR_CODE : 'NZB_DOWNLOAD_QUEUE_TIMEOUT';
+      reject(error);
+    }, timeoutMs);
+    waiter.timer.unref?.();
+    nzbDownloadQueue.push(waiter);
+  });
+}
+
+function releaseNzbDownloadSlot() {
+  const waiter = nzbDownloadQueue.shift();
+  if (waiter) {
+    clearTimeout(waiter.timer);
+    waiter.resolve(releaseNzbDownloadSlot);
+    return;
+  }
+  activeNzbDownloads = Math.max(0, activeNzbDownloads - 1);
+}
+
+async function runWithGlobalNzbDownloadSlot(task, deadlineTs = null) {
+  const release = await acquireNzbDownloadSlot(deadlineTs);
+  try { return await task(); }
+  finally { release(); }
+}
 
 async function runNzbDownloadSingleFlight(downloadUrl, task) {
   if (!downloadUrl) return task();
@@ -38,7 +104,7 @@ async function runNzbDownloadSingleFlight(downloadUrl, task) {
   }
 }
 
-async function runWithIndexerSerialization(indexerKey, enabled, task) {
+async function runWithIndexerSerialization(indexerKey, enabled, task, deadlineTs = null) {
   if (!enabled || !indexerKey) return task();
   const previous = serializedIndexerChains.get(indexerKey) || Promise.resolve();
   let releaseCurrent;
@@ -47,10 +113,31 @@ async function runWithIndexerSerialization(indexerKey, enabled, task) {
   });
   const chained = previous.then(() => currentGate);
   serializedIndexerChains.set(indexerKey, chained);
-  await previous;
+  let waitTimer = null;
   try {
+    if (Number.isFinite(deadlineTs)) {
+      const remainingMs = deadlineTs - Date.now();
+      if (remainingMs <= 0) {
+        const error = new Error('Triage timed out waiting for serialized indexer access');
+        error.code = TIMEOUT_ERROR_CODE;
+        throw error;
+      }
+      await Promise.race([
+        previous,
+        new Promise((_, reject) => {
+          waitTimer = setTimeout(() => {
+            const error = new Error('Triage timed out waiting for serialized indexer access');
+            error.code = TIMEOUT_ERROR_CODE;
+            reject(error);
+          }, remainingMs);
+        }),
+      ]);
+    } else {
+      await previous;
+    }
     return await task();
   } finally {
+    if (waitTimer) clearTimeout(waitTimer);
     releaseCurrent();
     if (serializedIndexerChains.get(indexerKey) === chained) {
       serializedIndexerChains.delete(indexerKey);
@@ -226,6 +313,7 @@ function summarizeDecision(decision) {
 async function triageAndRank(nzbResults, options = {}) {
   const startTs = Date.now();
   const timeBudgetMs = options.timeBudgetMs ?? DEFAULT_TIME_BUDGET_MS;
+  const triageDeadlineTs = startTs + timeBudgetMs;
   const preferredSizeBytes = Number.isFinite(options.preferredSizeBytes) ? options.preferredSizeBytes : null;
   const preferredIndexerSet = normalizeIndexerSet(options.preferredIndexerIds);
   const serializedIndexerSet = normalizeIndexerSet(options.serializedIndexerIds);
@@ -424,7 +512,7 @@ async function triageAndRank(nzbResults, options = {}) {
         try {
           nzbPayload = await runNzbDownloadSingleFlight(
             downloadUrl,
-            () => runWithIndexerSerialization(
+            () => runWithGlobalNzbDownloadSlot(() => runWithIndexerSerialization(
               serializedIndexerKey || indexerKey,
               Boolean(serializedIndexerKey),
               async () => {
@@ -455,15 +543,17 @@ async function triageAndRank(nzbResults, options = {}) {
                   },
                   transitional: { silentJSONParsing: true, forcedJSONParsing: false },
                   proxy: false,
+                  ...axiosResponseLimit(RESPONSE_LIMITS.nzbDownload),
                 };
-                // Proxy configured => follow redirects manually, re-evaluating the
-                // proxy per hop (a manager 301 to the real indexer must ride the
-                // proxy, not leak direct); fail-closed on a bad proxy. No proxy =>
-                // normal auto-follow.
-                const response = await (resolvedProxy
-                  ? proxiedGet(downloadUrl, resolvedProxy, dlConfig)
-                  : axios.get(downloadUrl, dlConfig)
-                ).finally(() => {
+                const allowedHosts = [
+                  ...getManagerDownloadAllowedHosts(),
+                  ...getDownloadAllowedHostsForIndexer(candidate.indexerId || candidate.indexerName),
+                ];
+                const response = await safeBufferedGet(downloadUrl, {
+                  ...dlConfig,
+                  proxyUrl: resolvedProxy || '',
+                  allowedHosts,
+                }).finally(() => {
                   clearTimeout(hardTimeoutTimer);
                 });
                 if (typeof response.data !== 'string' || response.data.length === 0) {
@@ -471,7 +561,8 @@ async function triageAndRank(nzbResults, options = {}) {
                 }
                 return response.data;
               },
-            ),
+              triageDeadlineTs,
+            ), triageDeadlineTs),
           );
           const elapsed = Date.now() - downloadStart;
           // Cache the downloaded payload for potential retries. Coalesced
@@ -663,4 +754,5 @@ module.exports = {
   triageAndRank,
   runWithIndexerSerialization,
   runNzbDownloadSingleFlight,
+  runWithGlobalNzbDownloadSlot,
 };

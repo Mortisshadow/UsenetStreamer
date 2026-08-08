@@ -23,6 +23,7 @@ let indexSaveTimer = null;
 let maintenanceTimer = null;
 let indexWriteChain = Promise.resolve();
 let cacheGeneration = 0;
+let indexRevision = 0;
 let pendingWriteSequence = 0;
 
 // 30-day TTL backstop (the size budget below is the primary control).
@@ -81,11 +82,19 @@ function loadIndex() {
     if (Array.isArray(entries)) {
       index = new Map();
       const now = Date.now();
+      let migratedCredentialUrls = false;
       for (const entry of entries) {
         if (entry.expiresAt && entry.expiresAt <= now) continue;
-        if (!entry.url || !entry.hash) continue;
-        index.set(entry.url, entry);
+        // Legacy indexes contained the complete credential-bearing download
+        // URL. Migrate in memory to the existing SHA-256 payload key and never
+        // persist the URL again.
+        const hash = entry.hash || (entry.url ? urlHash(entry.url) : null);
+        if (!hash) continue;
+        const { url: _legacyUrl, ...safeEntry } = entry;
+        if (_legacyUrl) migratedCredentialUrls = true;
+        index.set(hash, { ...safeEntry, hash });
       }
+      if (migratedCredentialUrls) saveIndex();
     }
   } catch {
     index = new Map();
@@ -93,11 +102,17 @@ function loadIndex() {
 }
 
 function saveIndex() {
+  let tempPath = null;
   try {
     ensureDir();
     const entries = Array.from(index.values());
-    fs.writeFileSync(indexPath, JSON.stringify(entries, null, 2), 'utf8');
+    tempPath = `${indexPath}.${process.pid}.${++pendingWriteSequence}.tmp`;
+    fs.writeFileSync(tempPath, JSON.stringify(entries, null, 2), 'utf8');
+    fs.renameSync(tempPath, indexPath);
   } catch (err) {
+    if (tempPath) {
+      try { fs.unlinkSync(tempPath); } catch { /* ignore */ }
+    }
     console.warn('[DISK-CACHE] Failed to save index:', err.message);
   }
 }
@@ -105,20 +120,27 @@ function saveIndex() {
 function saveIndexAsync() {
   ensureDir();
   const snapshot = JSON.stringify(Array.from(index.values()));
-  const tempPath = `${indexPath}.${process.pid}.tmp`;
+  const writeIndexPath = indexPath;
+  const tempPath = `${writeIndexPath}.${process.pid}.${++pendingWriteSequence}.tmp`;
   const writeGeneration = cacheGeneration;
+  const writeRevision = indexRevision;
   indexWriteChain = indexWriteChain
     .catch(() => undefined)
     .then(async () => {
-      if (writeGeneration !== cacheGeneration) return;
+      if (writeGeneration !== cacheGeneration || writeRevision !== indexRevision) return;
       await fs.promises.writeFile(tempPath, snapshot, 'utf8');
-      if (writeGeneration !== cacheGeneration) {
+      if (writeGeneration !== cacheGeneration || writeRevision !== indexRevision) {
         try { await fs.promises.unlink(tempPath); } catch { /* ignore */ }
         return;
       }
-      await fs.promises.rename(tempPath, indexPath);
+      // The synchronous rename makes the last ownership check + publication
+      // indivisible with respect to clearDiskCache()/reloadConfig() in this
+      // process. A clear cannot interleave after the check and resurrect an
+      // old index snapshot.
+      fs.renameSync(tempPath, writeIndexPath);
     })
-    .catch((err) => {
+    .catch(async (err) => {
+      try { await fs.promises.unlink(tempPath); } catch { /* ignore */ }
       console.warn('[DISK-CACHE] Failed to save index asynchronously:', err.message);
     });
   return indexWriteChain;
@@ -165,7 +187,11 @@ function reconcile() {
   let removed = 0;
   let removedBytes = 0;
   for (const file of files) {
-    if (!file.endsWith('.nzb') || referenced.has(file)) continue;
+    const isOrphanedPayload = file.endsWith('.nzb') && !referenced.has(file);
+    // Atomic writers use cache-local .tmp files. None can legitimately survive
+    // process startup/reconciliation; reclaim crash leftovers as well.
+    const isStaleTemp = file.endsWith('.tmp');
+    if (!isOrphanedPayload && !isStaleTemp) continue;
     try {
       const p = path.join(cacheDir, file);
       removedBytes += fs.statSync(p).size;
@@ -176,6 +202,7 @@ function reconcile() {
   if (removed > 0) {
     console.log(`[DISK-CACHE] Reclaimed ${removed} orphaned payload(s) (${(removedBytes / 1024 / 1024).toFixed(1)} MB)`);
   }
+  if (changed) indexRevision += 1;
   return changed;
 }
 
@@ -234,6 +261,7 @@ function cleanup({ deferredSave = false } = {}) {
   }
 
   if (changed) {
+    indexRevision += 1;
     if (deferredSave) scheduleIndexSave();
     else saveIndex();
   }
@@ -256,7 +284,6 @@ function cacheToDisk(downloadUrl, nzbPayload, metadata = {}) {
   const expiresAt = CACHE_TTL_MS > 0 ? now + CACHE_TTL_MS : null;
   const payloadBuffer = Buffer.from(nzbPayload, 'utf8');
   const entry = {
-    url: downloadUrl,
     hash,
     title: metadata.title || null,
     sizeBytes: metadata.size || null,
@@ -268,27 +295,36 @@ function cacheToDisk(downloadUrl, nzbPayload, metadata = {}) {
   };
   // Make the payload immediately reusable by NZBDav/auto-advance while the
   // actual disk write proceeds outside the request's critical path.
-  pendingPayloads.set(downloadUrl, { payloadBuffer, entry });
-
-  const targetPath = payloadPath(hash);
+  const writeGeneration = cacheGeneration;
+  const writeCacheDir = cacheDir;
+  const targetPath = path.join(writeCacheDir, `${hash}.nzb`);
   pendingWriteSequence += 1;
   const tempPath = `${targetPath}.${process.pid}.${now}.${pendingWriteSequence}.tmp`;
-  const writeGeneration = cacheGeneration;
+  const ownership = { generation: writeGeneration, sequence: pendingWriteSequence };
+  const pendingEntry = { payloadBuffer, entry, ownership };
+  pendingPayloads.set(hash, pendingEntry);
   const writePromise = (async () => {
     try {
-      await fs.promises.mkdir(cacheDir, { recursive: true });
+      await fs.promises.mkdir(writeCacheDir, { recursive: true });
       await fs.promises.writeFile(tempPath, payloadBuffer);
-      await fs.promises.rename(tempPath, targetPath);
-      if (writeGeneration !== cacheGeneration) return;
-      index.set(downloadUrl, entry);
+      // A newer writer for this URL, a clear, or a directory reload revokes
+      // ownership. Never let the stale writer replace its payload.
+      if (writeGeneration !== cacheGeneration || pendingPayloads.get(hash) !== pendingEntry) {
+        try { await fs.promises.unlink(tempPath); } catch { /* ignore */ }
+        return;
+      }
+      // Keep ownership validation and publication atomic relative to the
+      // synchronous cache lifecycle methods in this process.
+      fs.renameSync(tempPath, targetPath);
+      index.set(hash, entry);
+      indexRevision += 1;
       scheduleIndexSave();
       scheduleMaintenance();
     } catch (err) {
       try { await fs.promises.unlink(tempPath); } catch { /* ignore */ }
       console.warn('[DISK-CACHE] Failed to write NZB payload:', err.message);
     } finally {
-      const pending = pendingPayloads.get(downloadUrl);
-      if (pending?.entry === entry) pendingPayloads.delete(downloadUrl);
+      if (pendingPayloads.get(hash) === pendingEntry) pendingPayloads.delete(hash);
     }
   })();
   return writePromise;
@@ -297,7 +333,8 @@ function cacheToDisk(downloadUrl, nzbPayload, metadata = {}) {
 function getFromDisk(downloadUrl) {
   if (!downloadUrl) return null;
   init();
-  const pending = pendingPayloads.get(downloadUrl);
+  const hash = urlHash(downloadUrl);
+  const pending = pendingPayloads.get(hash);
   if (pending) {
     return {
       downloadUrl,
@@ -311,17 +348,19 @@ function getFromDisk(downloadUrl) {
       createdAt: pending.entry.createdAt,
     };
   }
-  const entry = index.get(downloadUrl);
+  const entry = index.get(hash);
   if (!entry) return null;
   if (entry.expiresAt && entry.expiresAt <= Date.now()) {
     tryDeleteFile(entry.hash);
-    index.delete(downloadUrl);
+    index.delete(hash);
+    indexRevision += 1;
     return null;
   }
   try {
     const p = payloadPath(entry.hash);
     if (!fs.existsSync(p)) {
-      index.delete(downloadUrl);
+      index.delete(hash);
+      indexRevision += 1;
       return null;
     }
     const payload = fs.readFileSync(p, 'utf8');
@@ -349,8 +388,9 @@ function getFromDisk(downloadUrl) {
 function hasCachedPayload(downloadUrl) {
   if (!downloadUrl) return false;
   init();
-  if (pendingPayloads.has(downloadUrl)) return true;
-  const entry = index.get(downloadUrl);
+  const hash = urlHash(downloadUrl);
+  if (pendingPayloads.has(hash)) return true;
+  const entry = index.get(hash);
   if (!entry) return false;
   if (entry.expiresAt && entry.expiresAt <= Date.now()) return false;
   return fs.existsSync(payloadPath(entry.hash));
@@ -358,7 +398,7 @@ function hasCachedPayload(downloadUrl) {
 
 function clearDiskCache(reason = 'manual') {
   init();
-  const count = index.size;
+  const count = index.size + pendingPayloads.size;
   cacheGeneration += 1;
   if (indexSaveTimer) clearTimeout(indexSaveTimer);
   if (maintenanceTimer) clearTimeout(maintenanceTimer);
@@ -369,6 +409,7 @@ function clearDiskCache(reason = 'manual') {
     tryDeleteFile(entry.hash);
   }
   index.clear();
+  indexRevision += 1;
   saveIndex();
   // Also sweep any stray files so a clear truly empties the directory.
   reconcile();
@@ -405,6 +446,8 @@ function reloadConfig() {
     indexSaveTimer = null;
     maintenanceTimer = null;
     pendingPayloads.clear();
+    index = new Map();
+    indexRevision += 1;
     cacheDir = newDir;
     indexPath = path.join(cacheDir, INDEX_FILE);
     initialized = false;

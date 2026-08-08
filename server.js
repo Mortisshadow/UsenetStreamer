@@ -1,14 +1,23 @@
 require('dotenv').config();
 
-// Global safety net: prevent unhandled errors from crashing the server.
-// This catches socket-level errors (e.g. NNTP TLS EACCES) that escape all other handlers.
-process.on('uncaughtException', (err) => {
-  console.error('[FATAL] Uncaught exception (process kept alive):', err?.message || err);
-  if (err?.code) console.error('[FATAL] Error code:', err.code);
-});
-process.on('unhandledRejection', (reason) => {
-  console.error('[FATAL] Unhandled promise rejection (process kept alive):', reason?.message || reason);
-});
+// An unhandled process-level failure leaves application state undefined. Log a
+// minimal, non-secret diagnostic and let Docker/systemd restart a clean process
+// instead of continuing with potentially corrupted pools, locks, or caches.
+let fatalExitScheduled = false;
+function scheduleFatalExit(kind, failure) {
+  if (fatalExitScheduled) return;
+  fatalExitScheduled = true;
+  const rawMessage = failure instanceof Error ? failure.message : String(failure || 'unknown failure');
+  const message = rawMessage
+    .replace(/([?&](?:api[_-]?key|token|secret|password)=)[^&\s]+/gi, '$1***')
+    .replace(/\/\/[^/@\s]+@/g, '//***@');
+  console.error(`[FATAL] ${kind}:`, message);
+  if (failure?.code) console.error('[FATAL] Error code:', failure.code);
+  process.exitCode = 1;
+  setTimeout(() => process.exit(1), 100);
+}
+process.on('uncaughtException', (err) => scheduleFatalExit('Uncaught exception', err));
+process.on('unhandledRejection', (reason) => scheduleFatalExit('Unhandled promise rejection', reason));
 
 const crypto = require('crypto');
 const express = require('express');
@@ -53,7 +62,12 @@ const {
   testTmdbConnection,
 } = require('./src/utils/connectionTests');
 const { triageAndRank } = require('./src/services/triage/runner');
-const { preWarmNntpPool, evictStaleSharedNntpPool } = require('./src/services/triage');
+const {
+  preWarmNntpPool,
+  closeSharedNntpPool,
+  reconfigureSharedNntpPool,
+  evictStaleSharedNntpPool,
+} = require('./src/services/triage');
 const {
   getPublishMetadataFromResult,
   areReleasesWithinDays,
@@ -110,6 +124,9 @@ const autoAdvanceQueue = require('./src/services/autoAdvanceQueue');
 const backgroundTriage = require('./src/services/backgroundTriage');
 const diskNzbCache = require('./src/cache/diskNzbCache');
 const profileManager = require('./src/services/profileManager');
+const { clearProxyAgentCache } = require('./src/utils/proxyAgent');
+const { safeBufferedGet } = require('./src/utils/safeDownload');
+const { RESPONSE_LIMITS, axiosResponseLimit } = require('./src/utils/responseLimits');
 
 // Periodic janitor — prune caches + sessions on a timer so RAM/disk stay
 // bounded without relying on an admin config-save. unref() so it never keeps
@@ -140,6 +157,84 @@ const RELEASE_BLOCKLIST_REGEX = /(?:^|[\s.\-_(\[])(?:iso|img|bin|cue|exe)(?:[\s.
 
 const PREFETCH_NZBDAV_JOB_TTL_MS = 60 * 60 * 1000;
 const prefetchedNzbdavJobs = new Map();
+
+// Coalesce identical cold stream searches. Stremio and proxy addons may issue
+// the same request more than once while the first indexer search is still in
+// flight; without coalescing each request performs the full external search and
+// triage preparation independently. Waiters re-read the normal stream cache
+// after the owner completes, so this does not introduce a second result cache.
+const streamSearchFlights = new Map();
+let streamSearchGeneration = 0;
+const STREAM_SEARCH_MAX_CONCURRENCY = (() => {
+  const raw = Number(process.env.NZB_SEARCH_MAX_CONCURRENCY);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 12;
+})();
+const STREAM_SEARCH_MAX_QUEUE = (() => {
+  const raw = Number(process.env.NZB_SEARCH_MAX_QUEUE);
+  return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 64;
+})();
+const STREAM_SEARCH_QUEUE_TIMEOUT_MS = (() => {
+  const raw = Number(process.env.NZB_SEARCH_QUEUE_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw >= 1000 ? Math.floor(raw) : 10000;
+})();
+let activeColdStreamSearches = 0;
+const coldStreamSearchQueue = [];
+
+function acquireColdStreamSearchSlot() {
+  if (activeColdStreamSearches < STREAM_SEARCH_MAX_CONCURRENCY) {
+    activeColdStreamSearches += 1;
+    return Promise.resolve(releaseColdStreamSearchSlot);
+  }
+  if (coldStreamSearchQueue.length >= STREAM_SEARCH_MAX_QUEUE) {
+    const error = new Error('Stream search queue is full');
+    error.statusCode = 503;
+    return Promise.reject(error);
+  }
+  return new Promise((resolve, reject) => {
+    const waiter = { resolve, reject, timer: null };
+    waiter.timer = setTimeout(() => {
+      const index = coldStreamSearchQueue.indexOf(waiter);
+      if (index >= 0) coldStreamSearchQueue.splice(index, 1);
+      const error = new Error('Timed out waiting for a stream search slot');
+      error.statusCode = 503;
+      reject(error);
+    }, STREAM_SEARCH_QUEUE_TIMEOUT_MS);
+    waiter.timer.unref?.();
+    coldStreamSearchQueue.push(waiter);
+  });
+}
+
+function releaseColdStreamSearchSlot() {
+  const waiter = coldStreamSearchQueue.shift();
+  if (waiter) {
+    clearTimeout(waiter.timer);
+    waiter.resolve(releaseColdStreamSearchSlot);
+    return;
+  }
+  activeColdStreamSearches = Math.max(0, activeColdStreamSearches - 1);
+}
+
+function invalidateStreamSearchFlights(reason = 'configuration changed') {
+  streamSearchGeneration += 1;
+  for (const flight of streamSearchFlights.values()) {
+    flight.resolve({ invalidated: true, reason });
+  }
+  streamSearchFlights.clear();
+  prefetchedNzbdavJobs.clear();
+}
+
+function createStreamSearchFlight(cacheKey) {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  const flight = {
+    cacheKey,
+    generation: streamSearchGeneration,
+    promise,
+    resolve,
+  };
+  streamSearchFlights.set(cacheKey, flight);
+  return flight;
+}
 
 function prunePrefetchedNzbdavJobs() {
   if (prefetchedNzbdavJobs.size === 0) return;
@@ -461,6 +556,8 @@ adminApiRouter.post('/config', async (req, res) => {
     // KEEP the on-disk NZB payloads — they stay valid across settings changes and
     // give fast re-mounts without re-downloading from indexers.
     cache.clearTransientCaches('admin-config-save');
+    clearProxyAgentCache();
+    invalidateStreamSearchFlights('admin-config-save');
     seasonPackSearch.clear('admin-config-save');
     backgroundTriage.closeAllSessions('admin-config-save');
     autoAdvanceQueue.closeAllSessions('admin-config-save');
@@ -545,6 +642,8 @@ adminApiRouter.post('/profiles', (req, res) => {
     runtimeEnv.updateRuntimeEnv(updates);
     runtimeEnv.applyRuntimeEnv();
     cache.clearTransientCaches('profile-save');
+    clearProxyAgentCache();
+    invalidateStreamSearchFlights('profile-save');
     seasonPackSearch.clear('profile-save');
     backgroundTriage.closeAllSessions('profile-save');
     autoAdvanceQueue.closeAllSessions('profile-save');
@@ -571,6 +670,8 @@ adminApiRouter.delete('/profiles/:slug', (req, res) => {
     runtimeEnv.updateRuntimeEnv(updates);
     runtimeEnv.applyRuntimeEnv();
     cache.clearTransientCaches('profile-delete');
+    clearProxyAgentCache();
+    invalidateStreamSearchFlights('profile-delete');
     seasonPackSearch.clear('profile-delete');
     backgroundTriage.closeAllSessions('profile-delete');
     autoAdvanceQueue.closeAllSessions('profile-delete');
@@ -1102,7 +1203,7 @@ function restartSharedPoolMonitor() {
     clearInterval(sharedPoolMonitorTimer);
     sharedPoolMonitorTimer = null;
   }
-  if (!TRIAGE_ENABLED || !TRIAGE_REUSE_POOL || !TRIAGE_NNTP_CONFIG) {
+  if ((!TRIAGE_ENABLED && !anyProfileEnablesTriage()) || !TRIAGE_REUSE_POOL || !TRIAGE_NNTP_CONFIG) {
     return;
   }
   const intervalMs = Math.max(30000, TRIAGE_NNTP_KEEP_ALIVE_MS || 120000);
@@ -1237,7 +1338,17 @@ function rebuildRuntimeConfig({ log = true } = {}) {
     healthCheckTimeoutMs: TRIAGE_TIME_BUDGET_MS,
   };
 
-  maybePrewarmSharedNntpPool();
+  const shouldKeepSharedPool = (TRIAGE_ENABLED || anyProfileEnablesTriage())
+    && TRIAGE_REUSE_POOL
+    && TRIAGE_NNTP_CONFIG;
+  reconfigureSharedNntpPool(
+    shouldKeepSharedPool ? buildSharedPoolOptions() : null,
+    'runtime-config-changed',
+  ).then(() => {
+    if (shouldKeepSharedPool) console.log('[NZB TRIAGE] Shared NNTP pool configured');
+  }).catch((err) => {
+    console.warn('[NZB TRIAGE] Unable to reconfigure shared NNTP pool', err?.message || err);
+  });
   restartSharedPoolMonitor();
   const resolvedAddonBase = ADDON_BASE_URL || `http://${SERVER_HOST}:${currentPort}`;
   easynewsService.reloadConfig({ addonBaseUrl: resolvedAddonBase, sharedSecret: ADDON_STREAM_TOKEN });
@@ -1709,6 +1820,9 @@ const handleEasynewsNzbDownload = createEasynewsHandler(getRouteConfig);
 
 async function streamHandler(req, res) {
   const requestStartTs = Date.now();
+  const requestGeneration = streamSearchGeneration;
+  let ownedStreamSearchFlight = null;
+  let releaseColdSearchSlot = null;
   const { type, id } = req.params;
   // Scope sessions by profile so two profiles never share auto-advance/triage
   // candidate lists. Travels in the callback URL query (read back by the
@@ -2031,45 +2145,89 @@ async function streamHandler(req, res) {
           cachedStreamEntry = null;
         }
       }
-      if (cachedStreamEntry) {
-        const cacheMeta = cachedStreamEntry.meta;
-        if (cacheMeta?.version === 1 && Array.isArray(cacheMeta.finalNzbResults)) {
-          const snapshot = Array.isArray(cacheMeta.triageDecisionsSnapshot) ? cacheMeta.triageDecisionsSnapshot : [];
-          cachedTriageDecisionMap = restoreTriageDecisions(snapshot);
-          if (!cacheMeta.triageComplete && Array.isArray(cacheMeta.triagePendingDownloadUrls)) {
-            const pendingList = cacheMeta.triagePendingDownloadUrls;
-            const unresolved = pendingList.filter((downloadUrl) => {
-              const decision = cachedTriageDecisionMap.get(downloadUrl);
-              return !isTriageFinalStatus(decision?.status);
-            });
-            if (unresolved.length === 0) {
-              cacheMeta.triageComplete = true;
-              cacheMeta.triagePendingDownloadUrls = [];
-            } else if (unresolved.length !== pendingList.length) {
-              cacheMeta.triagePendingDownloadUrls = unresolved;
-            }
-          }
-          cachedSearchMeta = cacheMeta;
-          if (cacheMeta.triageComplete) {
-            console.log('[CACHE] Stream cache hit (rehydrating finalized results)', {
-              type,
-              id,
-              cachedStreams: cachedStreamEntry.payload?.streams?.length || 0,
-            });
-          } else {
-            console.log('[CACHE] Reusing cached search results for pending triage', {
-              type,
-              id,
-              pending: cacheMeta.triagePendingDownloadUrls?.length || 0,
-            });
-          }
-        } else if (!cacheMeta || cacheMeta.triageComplete) {
-          console.log('[CACHE] Stream cache hit (legacy payload)', { type, id });
-          res.json(cachedStreamEntry.payload);
-          return;
-        } else {
-          console.log('[CACHE] Entry missing usable metadata; ignoring context');
+    }
+
+    // Only one request owns an identical cold search at a time. A failed or
+    // empty owner does not strand waiters: the next waiter atomically becomes
+    // the new owner and gets a normal attempt of its own.
+    while (streamCacheKey && !cachedStreamEntry && !ownedStreamSearchFlight) {
+      const existingFlight = streamSearchFlights.get(streamCacheKey);
+      if (!existingFlight) {
+        if (requestGeneration !== streamSearchGeneration) {
+          const error = new Error('Configuration changed while stream search was starting; retry the request');
+          error.statusCode = 503;
+          throw error;
         }
+        ownedStreamSearchFlight = createStreamSearchFlight(streamCacheKey);
+        releaseColdSearchSlot = await acquireColdStreamSearchSlot();
+        if (requestGeneration !== streamSearchGeneration) {
+          releaseColdSearchSlot();
+          releaseColdSearchSlot = null;
+          const error = new Error('Configuration changed while waiting for a stream search slot; retry the request');
+          error.statusCode = 503;
+          throw error;
+        }
+        break;
+      }
+      console.log('[SEARCH] Waiting for identical in-flight stream search', { type, id });
+      await existingFlight.promise;
+      cachedStreamEntry = cache.getStreamCacheEntry(streamCacheKey);
+      if (cachedStreamEntry && !(Array.isArray(cachedStreamEntry.payload?.streams)
+        && cachedStreamEntry.payload.streams.length > 0)) {
+        cachedStreamEntry = null;
+      }
+    }
+    if (!streamCacheKey) {
+      releaseColdSearchSlot = await acquireColdStreamSearchSlot();
+      if (requestGeneration !== streamSearchGeneration) {
+        releaseColdSearchSlot();
+        releaseColdSearchSlot = null;
+        const error = new Error('Configuration changed while waiting for a stream search slot; retry the request');
+        error.statusCode = 503;
+        throw error;
+      }
+    }
+
+    // Process both an immediate cache hit and the result produced by an owner
+    // request that this request just waited for.
+    if (cachedStreamEntry) {
+      const cachedMeta = cachedStreamEntry.meta;
+      if (cachedMeta?.version === 1 && Array.isArray(cachedMeta.finalNzbResults)) {
+        const snapshot = Array.isArray(cachedMeta.triageDecisionsSnapshot) ? cachedMeta.triageDecisionsSnapshot : [];
+        cachedTriageDecisionMap = restoreTriageDecisions(snapshot);
+        if (!cachedMeta.triageComplete && Array.isArray(cachedMeta.triagePendingDownloadUrls)) {
+          const pendingList = cachedMeta.triagePendingDownloadUrls;
+          const unresolved = pendingList.filter((downloadUrl) => {
+            const decision = cachedTriageDecisionMap.get(downloadUrl);
+            return !isTriageFinalStatus(decision?.status);
+          });
+          if (unresolved.length === 0) {
+            cachedMeta.triageComplete = true;
+            cachedMeta.triagePendingDownloadUrls = [];
+          } else if (unresolved.length !== pendingList.length) {
+            cachedMeta.triagePendingDownloadUrls = unresolved;
+          }
+        }
+        cachedSearchMeta = cachedMeta;
+        if (cachedMeta.triageComplete) {
+          console.log('[CACHE] Stream cache hit (rehydrating finalized results)', {
+            type,
+            id,
+            cachedStreams: cachedStreamEntry.payload?.streams?.length || 0,
+          });
+        } else {
+          console.log('[CACHE] Reusing cached search results for pending triage', {
+            type,
+            id,
+            pending: cachedMeta.triagePendingDownloadUrls?.length || 0,
+          });
+        }
+      } else if (!cachedMeta || cachedMeta.triageComplete) {
+        console.log('[CACHE] Stream cache hit (legacy payload)', { type, id });
+        res.json(cachedStreamEntry.payload);
+        return;
+      } else {
+        console.log('[CACHE] Entry missing usable metadata; ignoring context');
       }
     }
 
@@ -4822,7 +4980,11 @@ async function streamHandler(req, res) {
         // plain HTTP, fall back to the indexer's direct HTTPS link (Stremio refuses
         // to play HTTP addon URLs).
         const nativeNzbUrl = /^https:/i.test(addonBaseUrl)
-          ? `${addonBaseUrl}${ADDON_STREAM_TOKEN ? `/${ADDON_STREAM_TOKEN}` : ''}/nzb/fetch/${encodeStreamParams(new URLSearchParams({ downloadUrl: result.downloadUrl, filename: result.title || '' }))}`
+          ? `${addonBaseUrl}${ADDON_STREAM_TOKEN ? `/${ADDON_STREAM_TOKEN}` : ''}/nzb/fetch/${encodeStreamParams(new URLSearchParams({
+              downloadUrl: result.downloadUrl,
+              filename: result.title || '',
+              indexer: result.indexerId || result.indexer || '',
+            }))}`
           : result.downloadUrl;
         stream = {
           name: formattedName,
@@ -5026,8 +5188,12 @@ async function streamHandler(req, res) {
     }
 
     const responsePayload = { streams };
-    if (streamCacheKey && cacheMeta && streams.length > 0) {
+    const streamSearchStillCurrent = requestGeneration === streamSearchGeneration
+      && (!ownedStreamSearchFlight || ownedStreamSearchFlight.generation === streamSearchGeneration);
+    if (streamCacheKey && cacheMeta && streams.length > 0 && streamSearchStillCurrent) {
       cache.setStreamCacheEntry(streamCacheKey, responsePayload, cacheMeta);
+    } else if (streamCacheKey && cacheMeta && streams.length > 0) {
+      console.log('[CACHE] Skipping stale stream cache write after configuration change', { type, id });
     } else if (streamCacheKey && cacheMeta) {
       console.log('[CACHE] Skipping stream cache write for empty stream payload', { type, id });
     }
@@ -5057,7 +5223,8 @@ async function streamHandler(req, res) {
     res.json(responsePayload);
 
     // Background triage: start health checking after the response is sent
-    if (shouldAttemptBackgroundTriage && effStreamingMode !== 'native' && TRIAGE_NNTP_CONFIG && triageCandidatesToRun.length > 0) {
+    if (requestGeneration === streamSearchGeneration
+      && shouldAttemptBackgroundTriage && effStreamingMode !== 'native' && TRIAGE_NNTP_CONFIG && triageCandidatesToRun.length > 0) {
       // Reuse existing background session if it's still running or has results
       const existingBgSession = backgroundTriage.getSession(contentKey);
       if (existingBgSession) {
@@ -5071,6 +5238,7 @@ async function streamHandler(req, res) {
       } else {
       setImmediate(() => {
         try {
+          if (requestGeneration !== streamSearchGeneration) return;
           const triageLogger = (level, message, context) => {
             const logFn = level === 'error' ? console.error : level === 'warn' ? console.warn : console.log;
             if (context) logFn(`[BG-TRIAGE] ${message}`, context);
@@ -5113,7 +5281,7 @@ async function streamHandler(req, res) {
               });
             });
           };
-          backgroundTriage.start(contentKey, triagePool, bgTriageOptions, {
+          const bgStart = backgroundTriage.getOrStart(contentKey, triagePool, bgTriageOptions, {
             queueToNzbdav,
             getCachedEntry: (url) => diskNzbCache.getFromDisk(url),
             category: categoryForType,
@@ -5143,13 +5311,27 @@ async function streamHandler(req, res) {
               }
             },
           });
+          const bgSession = bgStart.session;
+          if (!bgStart.created) {
+            const progress = bgSession.getProgress();
+            console.log(`[BG-TRIAGE] Concurrent start reused existing session for ${contentKey}`, {
+              evaluated: progress.evaluated,
+              verified: progress.verified,
+              blocked: progress.blocked,
+              complete: progress.triageComplete,
+            });
+            return;
+          }
 
           // After background triage completes, patch decisions into the stream cache
           // so the next visit shows ✅/⚠️/🚫 badges on individual streams
           if (streamCacheKey) {
-            const bgSession = backgroundTriage.getSession(contentKey);
             if (bgSession?.runPromise) {
               bgSession.runPromise.then(() => {
+                // A config save or explicit close can retire this generation while
+                // its late NNTP workers finish. Never publish stale decisions into
+                // the new configuration's stream cache.
+                if (!backgroundTriage.isCurrentSession(contentKey, bgSession)) return;
                 const decisions = bgSession.decisions;
                 if (!decisions || decisions.size === 0) return;
                 const patchedEntries = Array.from(decisions.entries())
@@ -5167,8 +5349,15 @@ async function streamHandler(req, res) {
                     existingMap.set(url, dec);
                   }
                   meta.triageDecisionsSnapshot = Array.from(existingMap.entries());
-                  meta.triageComplete = true;
-                  meta.triagePendingDownloadUrls = [];
+                  const previousPending = Array.isArray(meta.triagePendingDownloadUrls)
+                    ? meta.triagePendingDownloadUrls
+                    : [];
+                  const remainingPending = previousPending.filter((url) => {
+                    const decision = existingMap.get(url);
+                    return !isTriageFinalStatus(decision?.status);
+                  });
+                  meta.triagePendingDownloadUrls = remainingPending;
+                  meta.triageComplete = bgSession.triageComplete && remainingPending.length === 0;
                 });
                 if (updated) {
                   console.log(`[BG-TRIAGE] Patched ${patchedEntries.length} decisions into stream cache for ${contentKey}`);
@@ -5190,7 +5379,8 @@ async function streamHandler(req, res) {
     // Auto-advance session: create an auto-advance queue from ranked results whenever auto-advance is enabled
     // but NOT in background triage mode (which creates its own auto-advance queue via backgroundTriage.start)
     // Covers: "auto-advance" mode (no triage) and "health-check-auto-advance" mode (blocking triage + auto-advance)
-    if (effAutoAdvanceEnabled && !shouldAttemptBackgroundTriage
+    if (requestGeneration === streamSearchGeneration
+      && effAutoAdvanceEnabled && !shouldAttemptBackgroundTriage
       && effStreamingMode !== 'native' && finalNzbResults.length > 1) {
       const existingAutoAdvance = autoAdvanceQueue.getSession(contentKey);
       if (!existingAutoAdvance) {
@@ -5270,7 +5460,8 @@ async function streamHandler(req, res) {
       }
     }
 
-    if (effPrefetchFirstVerified && effStreamingMode !== 'native' && prefetchCandidate) {
+    if (requestGeneration === streamSearchGeneration
+      && effPrefetchFirstVerified && effStreamingMode !== 'native' && prefetchCandidate) {
       prunePrefetchedNzbdavJobs();
       // Skip if already completed in NZBDav (survives addon restarts unlike the in-memory map)
       const prefetchNormTitle = normalizeReleaseTitle(prefetchCandidate.title);
@@ -5288,6 +5479,11 @@ async function streamHandler(req, res) {
         const jobPromise = new Promise((resolve, reject) => {
           setImmediate(async () => {
             try {
+              if (requestGeneration !== streamSearchGeneration) {
+                const error = new Error('Configuration changed before NZB prefetch started');
+                error.code = 'STALE_REQUEST_GENERATION';
+                throw error;
+              }
               const cachedEntry = diskNzbCache.getFromDisk(prefetchCandidate.downloadUrl);
               if (cachedEntry) {
                 console.log('[CACHE] Using verified NZB payload for prefetch', { downloadUrl: redactSensitiveString(prefetchCandidate.downloadUrl) });
@@ -5299,6 +5495,11 @@ async function streamHandler(req, res) {
                 jobLabel: prefetchCandidate.title,
                 indexerId: prefetchCandidate.indexerId || null,
               });
+              if (requestGeneration !== streamSearchGeneration) {
+                const error = new Error('Configuration changed while NZB prefetch was running');
+                error.code = 'STALE_REQUEST_GENERATION';
+                throw error;
+              }
               resolve({
                 nzoId: added.nzoId,
                 category: prefetchCandidate.category,
@@ -5329,12 +5530,14 @@ async function streamHandler(req, res) {
 
         jobPromise
           .then((jobInfo) => {
+            if (requestGeneration !== streamSearchGeneration) return;
             prefetchedNzbdavJobs.set(prefetchDownloadUrl, jobInfo);
             console.log(`[PREFETCH] NZB queued to NZBDav (nzoId=${jobInfo.nzoId}, title=${prefetchTitle})`);
 
             // Monitor NZBDav for completion/failure asynchronously
             nzbdavService.waitForNzbdavHistorySlot(jobInfo.nzoId, prefetchCategory)
               .then((slot) => {
+                if (requestGeneration !== streamSearchGeneration) return;
                 const jobName = slot?.job_name || slot?.JobName || slot?.name || slot?.Name || prefetchTitle;
                 console.log(`[PREFETCH] NZB completed in NZBDav: ${jobName}`);
 
@@ -5355,6 +5558,7 @@ async function streamHandler(req, res) {
                 }
               })
               .catch((monitorError) => {
+                if (requestGeneration !== streamSearchGeneration) return;
                 console.warn(`[PREFETCH] NZB failed in NZBDav: ${monitorError.failureMessage || monitorError.message}`);
                 prefetchedNzbdavJobs.set(prefetchDownloadUrl, {
                   failed: true,
@@ -5374,6 +5578,7 @@ async function streamHandler(req, res) {
               });
           })
           .catch((prefetchError) => {
+            if (requestGeneration !== streamSearchGeneration) return;
             prefetchedNzbdavJobs.set(prefetchDownloadUrl, {
               failed: true,
               failureMessage: prefetchError.failureMessage || prefetchError.message,
@@ -5394,7 +5599,7 @@ async function streamHandler(req, res) {
     }
   } catch (error) {
     console.error('[ERROR] Processing failed:', error.message);
-    res.status(error.response?.status || 500).json({
+    res.status(error.statusCode || error.response?.status || 500).json({
       error: sanitizeErrorForClient(error),
       details: {
         type,
@@ -5402,6 +5607,15 @@ async function streamHandler(req, res) {
         timestamp: new Date().toISOString()
       }
     });
+  } finally {
+    if (releaseColdSearchSlot) releaseColdSearchSlot();
+    if (ownedStreamSearchFlight) {
+      const currentFlight = streamSearchFlights.get(ownedStreamSearchFlight.cacheKey);
+      if (currentFlight === ownedStreamSearchFlight) {
+        streamSearchFlights.delete(ownedStreamSearchFlight.cacheKey);
+      }
+      ownedStreamSearchFlight.resolve({ complete: true });
+    }
   }
 }
 
@@ -6017,11 +6231,19 @@ async function handleNzbFetch(req, res) {
     if (cachedEntry?.payloadBuffer) {
       buffer = cachedEntry.payloadBuffer; // reuse verified payload — no re-download
     } else {
-      const response = await axios.get(decoded.downloadUrl, {
+      const rowProxy = newznabService.getProxyForIndexer(decoded.indexer);
+      const resolvedProxy = rowProxy === null ? indexerService.getManagerProxy() : rowProxy;
+      const allowedHosts = [
+        ...indexerService.getManagerDownloadAllowedHosts(),
+        ...newznabService.getDownloadAllowedHostsForIndexer(decoded.indexer),
+      ];
+      const response = await safeBufferedGet(decoded.downloadUrl, {
         responseType: 'arraybuffer',
         timeout: 30000,
-        maxRedirects: 5,
-        validateStatus: (status) => status >= 200 && status < 400,
+        validateStatus: (status) => status >= 200 && status < 300,
+        proxyUrl: resolvedProxy || '',
+        allowedHosts,
+        ...axiosResponseLimit(RESPONSE_LIMITS.nzbDownload),
       });
       buffer = Buffer.from(response.data);
     }
@@ -6080,6 +6302,33 @@ async function restartHttpServer() {
 }
 
 startHttpServer();
+
+let gracefulShutdownStarted = false;
+async function gracefulShutdown(signal) {
+  if (gracefulShutdownStarted) return;
+  gracefulShutdownStarted = true;
+  console.log(`[SHUTDOWN] ${signal} received; closing active resources`);
+  invalidateStreamSearchFlights(`shutdown-${signal}`);
+  backgroundTriage.closeAllSessions(`shutdown-${signal}`);
+  autoAdvanceQueue.closeAllSessions(`shutdown-${signal}`);
+  clearProxyAgentCache();
+  const closeHttp = serverInstance
+    ? new Promise((resolve) => serverInstance.close(() => resolve()))
+    : Promise.resolve();
+  const forceExit = setTimeout(() => process.exit(1), 10000);
+  forceExit.unref?.();
+  try {
+    await Promise.all([closeHttp, closeSharedNntpPool(`shutdown-${signal}`)]);
+    clearTimeout(forceExit);
+    process.exit(0);
+  } catch (error) {
+    console.error('[SHUTDOWN] Cleanup failed:', error?.message || error);
+    process.exit(1);
+  }
+}
+
+process.once('SIGTERM', () => { gracefulShutdown('SIGTERM'); });
+process.once('SIGINT', () => { gracefulShutdown('SIGINT'); });
 
 // Startup security checks (v1.7.6+)
 if (!ADDON_SHARED_SECRET) {

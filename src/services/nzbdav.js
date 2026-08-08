@@ -10,13 +10,25 @@ const { promisify } = require('util');
 const { pipeline } = require('stream');
 const cache = require('../cache');
 const diskNzbCache = require('../cache/diskNzbCache');
-const { normalizeReleaseTitle, normalizeNzbdavPath, isVideoFileName, fileMatchesEpisode, inferMimeType } = require('../utils/parsers');
+const {
+  normalizeReleaseTitle,
+  normalizeNzbdavPath,
+  joinNzbdavPath,
+  isVideoFileName,
+  fileMatchesEpisode,
+  inferMimeType,
+} = require('../utils/parsers');
 const { redactSensitiveString } = require('../utils/logSanitizer');
 const { sleep, safeStat } = require('../utils/helpers');
 const { getDefaultDownloadUserAgent } = require('../utils/userAgent');
-const { getDownloadUserAgentForIndexer, getProxyForIndexer } = require('./newznab');
-const { getManagerProxy } = require('./indexer');
-const { proxiedGet } = require('../utils/proxyAgent');
+const {
+  getDownloadUserAgentForIndexer,
+  getProxyForIndexer,
+  getDownloadAllowedHostsForIndexer,
+} = require('./newznab');
+const { getManagerProxy, getManagerDownloadAllowedHosts } = require('./indexer');
+const { safeBufferedGet } = require('../utils/safeDownload');
+const { RESPONSE_LIMITS, axiosResponseLimit } = require('../utils/responseLimits');
 
 const pipelineAsync = promisify(pipeline);
 
@@ -55,8 +67,39 @@ const nzbdavHttpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50, maxF
 
 // File size cache: avoids repeated upstream HEAD/range probes for known files
 const FILE_SIZE_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+const FILE_SIZE_CACHE_SWEEP_INTERVAL_MS = 60 * 1000;
 const fileSizeCache = new Map();
 const historySnapshotCache = new Map();
+let lastFileSizeCacheSweepAt = 0;
+let FILE_SIZE_CACHE_MAX_ENTRIES = (() => {
+  const raw = Number(process.env.NZBDAV_FILE_SIZE_CACHE_MAX_ENTRIES);
+  return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 5000;
+})();
+let HISTORY_SNAPSHOT_CACHE_MAX_ENTRIES = (() => {
+  const raw = Number(process.env.NZBDAV_HISTORY_CACHE_MAX_ENTRIES);
+  return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 100;
+})();
+
+function cleanupFileSizeCache(now = Date.now()) {
+  if (now - lastFileSizeCacheSweepAt >= FILE_SIZE_CACHE_SWEEP_INTERVAL_MS) {
+    lastFileSizeCacheSweepAt = now;
+    for (const [key, entry] of fileSizeCache) {
+      if (now - entry.ts > FILE_SIZE_CACHE_TTL_MS) fileSizeCache.delete(key);
+    }
+  }
+  while (FILE_SIZE_CACHE_MAX_ENTRIES > 0 && fileSizeCache.size > FILE_SIZE_CACHE_MAX_ENTRIES) {
+    fileSizeCache.delete(fileSizeCache.keys().next().value);
+  }
+}
+
+function cleanupHistorySnapshotCache(now = Date.now()) {
+  for (const [key, entry] of historySnapshotCache) {
+    if (!entry.promise && entry.expiresAt <= now) historySnapshotCache.delete(key);
+  }
+  while (HISTORY_SNAPSHOT_CACHE_MAX_ENTRIES > 0 && historySnapshotCache.size > HISTORY_SNAPSHOT_CACHE_MAX_ENTRIES) {
+    historySnapshotCache.delete(historySnapshotCache.keys().next().value);
+  }
+}
 
 function getCachedFileSize(urlKey) {
   const entry = fileSizeCache.get(urlKey);
@@ -65,13 +108,27 @@ function getCachedFileSize(urlKey) {
     fileSizeCache.delete(urlKey);
     return null;
   }
+  // Map insertion order is the LRU order. Touch successful reads.
+  fileSizeCache.delete(urlKey);
+  fileSizeCache.set(urlKey, entry);
   return entry.size;
 }
 
 function setCachedFileSize(urlKey, size) {
   if (Number.isFinite(size) && size > 0) {
+    fileSizeCache.delete(urlKey);
     fileSizeCache.set(urlKey, { size, ts: Date.now() });
+    cleanupFileSizeCache();
   }
+}
+
+function getNzbdavLocalCacheStats() {
+  return {
+    fileSizes: fileSizeCache.size,
+    fileSizeMaxEntries: FILE_SIZE_CACHE_MAX_ENTRIES,
+    historySnapshots: historySnapshotCache.size,
+    historySnapshotMaxEntries: HISTORY_SNAPSHOT_CACHE_MAX_ENTRIES,
+  };
 }
 
 function resetWebdavClient() {
@@ -103,6 +160,16 @@ function reloadConfig() {
     const raw = Number(process.env.NZBDAV_HISTORY_SNAPSHOT_TTL_MS);
     return Number.isFinite(raw) && raw >= 0 ? raw : 2000;
   })();
+  FILE_SIZE_CACHE_MAX_ENTRIES = (() => {
+    const raw = Number(process.env.NZBDAV_FILE_SIZE_CACHE_MAX_ENTRIES);
+    return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 5000;
+  })();
+  HISTORY_SNAPSHOT_CACHE_MAX_ENTRIES = (() => {
+    const raw = Number(process.env.NZBDAV_HISTORY_CACHE_MAX_ENTRIES);
+    return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 100;
+  })();
+  fileSizeCache.clear();
+  lastFileSizeCacheSweepAt = 0;
   historySnapshotCache.clear();
   // Invalidate cached WebDAV client so next request uses fresh credentials
   resetWebdavClient();
@@ -262,14 +329,17 @@ async function addNzbToNzbdav({ downloadUrl, cachedEntry = null, category, jobLa
       headers: { 'User-Agent': downloadUa },
       validateStatus: (status) => status < 500,
       proxy: false,
+      ...axiosResponseLimit(RESPONSE_LIMITS.nzbDownload),
     };
-    // With a proxy configured, follow redirects MANUALLY and re-evaluate the
-    // proxy per hop: managers (esp. Prowlarr for Usenet) 301-redirect the
-    // localhost grab to the real public indexer, and axios's auto-follow would
-    // reuse the localhost (bypassed) decision and leak that hop direct.
-    const dlResponse = resolvedProxy
-      ? await proxiedGet(downloadUrl, resolvedProxy, dlConfig)
-      : await axios.get(downloadUrl, dlConfig);
+    const allowedHosts = [
+      ...getManagerDownloadAllowedHosts(),
+      ...getDownloadAllowedHostsForIndexer(indexerId),
+    ];
+    const dlResponse = await safeBufferedGet(downloadUrl, {
+      ...dlConfig,
+      proxyUrl: resolvedProxy || '',
+      allowedHosts,
+    });
 
     if (dlResponse.status >= 400) {
       throw new Error(`NZB download returned HTTP ${dlResponse.status}`);
@@ -320,10 +390,19 @@ async function addNzbToNzbdav({ downloadUrl, cachedEntry = null, category, jobLa
     console.log(`[NZBDAV] NZB queued with id ${nzoId} (downloaded+uploaded)`);
     return { nzoId };
   } catch (dlError) {
-    console.warn(`[NZBDAV] Download+addfile failed, falling back to addurl: ${dlError.message}`);
+    if (dlError?.code === 'OUTBOUND_URL_BLOCKED' || dlError?.code === 'OUTBOUND_URL_VALIDATION_FAILED') {
+      throw dlError;
+    }
+    const allowUnsafeAddurl = /^(?:1|true|yes|on)$/i.test(process.env.NZBDAV_ALLOW_UNSAFE_ADDURL_FALLBACK || '');
+    if (!allowUnsafeAddurl) {
+      const error = new Error(`[NZBDAV] Secure NZB download failed; addurl fallback is disabled: ${dlError.message}`);
+      error.cause = dlError;
+      throw error;
+    }
+    console.warn(`[NZBDAV] Download+addfile failed; explicit legacy addurl fallback is enabled: ${dlError.message}`);
   }
 
-  // Last resort: let NZBDav fetch the URL itself via addurl. NZBDav uses its own
+  // Explicit legacy opt-in only: let NZBDav fetch the URL itself via addurl. NZBDav uses its own
   // network stack and CANNOT honor our proxy (and would follow any manager
   // redirect to the real indexer directly) — so when a proxy is configured for
   // this indexer, refuse addurl (fail-closed) rather than leak.
@@ -526,24 +605,37 @@ async function fetchNzbdavHistorySnapshot(categories = [], limitOverride = null)
     : NZBDAV_HISTORY_FETCH_LIMIT;
   const cacheKey = `${normalizedCategories.join('|') || '*'}|${effectiveLimit}`;
   const now = Date.now();
+  cleanupHistorySnapshotCache(now);
   const cached = historySnapshotCache.get(cacheKey);
-  if (cached?.value && now < cached.expiresAt) return cached.value;
+  if (cached?.value && now < cached.expiresAt) {
+    historySnapshotCache.delete(cacheKey);
+    historySnapshotCache.set(cacheKey, cached);
+    return cached.value;
+  }
   if (cached?.promise) return cached.promise;
 
+  const pendingEntry = { value: null, expiresAt: 0, promise: null };
   const promise = fetchNzbdavHistorySnapshotUncached(normalizedCategories, effectiveLimit)
     .then((value) => {
-      historySnapshotCache.set(cacheKey, {
-        value,
-        expiresAt: Date.now() + NZBDAV_HISTORY_SNAPSHOT_TTL_MS,
-        promise: null,
-      });
+      // If LRU cleanup, reloadConfig(), or a newer request removed/replaced
+      // this entry, do not let the late snapshot repopulate the cache.
+      if (historySnapshotCache.get(cacheKey) === pendingEntry) {
+        historySnapshotCache.set(cacheKey, {
+          value,
+          expiresAt: Date.now() + NZBDAV_HISTORY_SNAPSHOT_TTL_MS,
+          promise: null,
+        });
+        cleanupHistorySnapshotCache();
+      }
       return value;
     })
     .catch((error) => {
-      historySnapshotCache.delete(cacheKey);
+      if (historySnapshotCache.get(cacheKey) === pendingEntry) historySnapshotCache.delete(cacheKey);
       throw error;
     });
-  historySnapshotCache.set(cacheKey, { value: null, expiresAt: 0, promise });
+  pendingEntry.promise = promise;
+  historySnapshotCache.set(cacheKey, pendingEntry);
+  cleanupHistorySnapshotCache(now);
   return promise;
 }
 
@@ -597,7 +689,7 @@ async function listWebdavDirectory(directory) {
 }
 
 async function findBestVideoFile({ category, jobName, requestedEpisode }) {
-  const rootPath = normalizeNzbdavPath(`/content/${category}/${jobName}`);
+  const rootPath = joinNzbdavPath('content', category, jobName);
   const queue = [{ path: rootPath, depth: 0 }];
   const visited = new Set();
   let bestMatch = null;
@@ -625,7 +717,14 @@ async function findBestVideoFile({ category, jobName, requestedEpisode }) {
       const entryName = entry?.name || entry?.Name;
       const isDirectory = entry?.isDirectory ?? entry?.IsDirectory;
       const entrySize = Number(entry?.size ?? entry?.Size ?? 0);
-      const nextPath = normalizeNzbdavPath(`${currentPath}/${entryName}`);
+      let nextPath;
+      try {
+        const parentSegments = normalizeNzbdavPath(currentPath).split('/').filter(Boolean);
+        nextPath = joinNzbdavPath(...parentSegments, entryName);
+      } catch (error) {
+        console.warn('[NZBDAV] Ignoring unsafe WebDAV entry name:', error.message);
+        continue;
+      }
 
       if (isDirectory) {
         queue.push({ path: nextPath, depth: depth + 1 });
@@ -1189,5 +1288,8 @@ module.exports = {
   streamVideoTypeFailure,
   proxyNzbdavStream,
   getWebdavClient,
+  getCachedFileSize,
+  setCachedFileSize,
+  getNzbdavLocalCacheStats,
   reloadConfig,
 };

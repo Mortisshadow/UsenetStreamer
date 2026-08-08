@@ -65,8 +65,39 @@ function fileMatchesEpisode(fileName, requestedEpisode) {
 
 function normalizeNzbdavPath(pathValue) {
   if (!pathValue) return '/';
-  const normalized = pathValue.replace(/\\/g, '/');
-  return normalized.startsWith('/') ? normalized : `/${normalized}`;
+  const rawPath = String(pathValue);
+  if (/[\u0000-\u001f\u007f]/.test(rawPath)) throw new Error('WebDAV path contains a control character');
+  const normalized = rawPath.replace(/\\/g, '/');
+  const segments = normalized.split('/').filter((segment) => segment && segment !== '.');
+  const safe = [];
+  for (const segment of segments) {
+    if (segment === '..') {
+      throw new Error('WebDAV path traversal is not allowed');
+    } else {
+      safe.push(segment);
+    }
+  }
+  return `/${safe.join('/')}`;
+}
+
+function sanitizeNzbdavPathSegment(value) {
+  const segment = String(value ?? '').trim();
+  if (!segment || segment === '.' || segment === '..') throw new Error('Invalid empty or relative WebDAV path segment');
+  if (/[\\/\u0000-\u001f\u007f]/.test(segment)) throw new Error('WebDAV path segment contains a separator or control character');
+  try {
+    const decoded = decodeURIComponent(segment);
+    if (decoded === '.' || decoded === '..' || /[\\/\u0000-\u001f\u007f]/.test(decoded)) {
+      throw new Error('WebDAV path segment contains encoded traversal or a separator');
+    }
+  } catch (error) {
+    if (/WebDAV/.test(error.message)) throw error;
+    throw new Error('WebDAV path segment contains invalid percent encoding');
+  }
+  return segment;
+}
+
+function joinNzbdavPath(...segments) {
+  return normalizeNzbdavPath(`/${segments.map(sanitizeNzbdavPathSegment).join('/')}`);
 }
 
 function inferMimeType(fileName) {
@@ -192,6 +223,8 @@ module.exports = {
   isVideoFileName,
   fileMatchesEpisode,
   normalizeNzbdavPath,
+  sanitizeNzbdavPathSegment,
+  joinNzbdavPath,
   inferMimeType,
   normalizeIndexerToken,
   nzbMatchesIndexer,

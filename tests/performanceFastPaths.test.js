@@ -21,6 +21,25 @@ test('serialized indexer tasks never overlap across concurrent callers', async (
   assert.equal(maximumActive, 1);
 });
 
+test('serialized indexer wait respects its deadline without wedging the chain', async () => {
+  let releaseFirst;
+  let firstStarted;
+  const started = new Promise((resolve) => { firstStarted = resolve; });
+  const first = runWithIndexerSerialization('deadline-indexer', true, async () => {
+    firstStarted();
+    await new Promise((resolve) => { releaseFirst = resolve; });
+  });
+  await started;
+
+  await assert.rejects(
+    runWithIndexerSerialization('deadline-indexer', true, async () => {}, Date.now() + 20),
+    { code: 'TRIAGE_TIMEOUT' },
+  );
+  releaseFirst();
+  await first;
+  await runWithIndexerSerialization('deadline-indexer', true, async () => {});
+});
+
 test('identical concurrent NZB downloads share one in-flight operation', async () => {
   let calls = 0;
   const task = async () => {

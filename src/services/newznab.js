@@ -4,6 +4,7 @@ const { stripTrailingSlashes } = require('../utils/config');
 const { getDefaultSearchUserAgent, getDefaultDownloadUserAgent } = require('../utils/userAgent');
 const { buildProxyAgents } = require('../utils/proxyAgent');
 const { redactSensitiveString } = require('../utils/logSanitizer');
+const { RESPONSE_LIMITS, axiosResponseLimit } = require('../utils/responseLimits');
 
 const MAX_NEWZNAB_INDEXERS = 20;
 const NEWZNAB_FIELD_SUFFIXES = ['ENDPOINT', 'API_KEY', 'API_PATH', 'NAME', 'INDEXER_ENABLED', 'PAID', 'PAID_LIMIT', 'ZYCLOPS', 'SEARCH_UA', 'DOWNLOAD_UA', 'PROXY'];
@@ -351,8 +352,11 @@ async function fetchNewznabCaps(config, options = {}) {
     responseType: 'text',
     validateStatus: () => true,
     proxy: false,
+    ...axiosResponseLimit(RESPONSE_LIMITS.newznabCaps),
     ...(buildProxyAgents(config.proxy, requestUrl) || {}),
   });
+  const contentType = response.headers?.['content-type'];
+  const body = typeof response.data === 'string' ? response.data : JSON.stringify(response.data);
   if (response.status === 401 || response.status === 403) {
     const protectionBlock = detectProtectionBlock(response.status, contentType, body);
     if (protectionBlock) {
@@ -363,7 +367,6 @@ async function fetchNewznabCaps(config, options = {}) {
   if (response.status >= 400) {
     throw new Error(`HTTP ${response.status}`);
   }
-  const body = typeof response.data === 'string' ? response.data : JSON.stringify(response.data);
   const explicitError = extractErrorFromBody(body);
   if (explicitError) {
     throw new Error(explicitError);
@@ -618,6 +621,26 @@ function getProxyForIndexer(identifier) {
     // ignore — treat as no match (manager fallback)
   }
   return null;
+}
+
+function getDownloadAllowedHostsForIndexer(identifier) {
+  if (!identifier) return [];
+  const target = String(identifier).trim().toLowerCase();
+  if (!target) return [];
+  try {
+    const configs = buildIndexerConfigs(process.env, { includeEmpty: false });
+    for (const config of configs) {
+      const candidates = [config.dedupeKey, config.slug, config.displayName, config.name]
+        .filter(Boolean)
+        .map((value) => String(value).toLowerCase());
+      if (!candidates.includes(target)) continue;
+      try { return [new URL(config.endpoint).hostname]; }
+      catch (_) { return []; }
+    }
+  } catch (_) {
+    return [];
+  }
+  return [];
 }
 
 // Seed default caps for any enabled indexer that has no cached caps
@@ -909,6 +932,7 @@ async function fetchIndexerResults(config, plan, options) {
     },
     validateStatus: () => true,
     proxy: false,
+    ...axiosResponseLimit(RESPONSE_LIMITS.newznabSearch),
     ...(buildProxyAgents(config.proxy, requestUrl) || {}),
   });
 
@@ -1083,6 +1107,7 @@ async function testNewznabCaps(config, options = {}) {
     responseType: 'text',
     validateStatus: () => true,
     proxy: false,
+    ...axiosResponseLimit(RESPONSE_LIMITS.newznabCaps),
     ...(buildProxyAgents(config.proxy, requestUrl) || {}),
   });
   const contentType = response.headers?.['content-type'];
@@ -1134,6 +1159,7 @@ module.exports = {
   filterUsableConfigs,
   getDownloadUserAgentForIndexer,
   getProxyForIndexer,
+  getDownloadAllowedHostsForIndexer,
   searchNewznabIndexers,
   testNewznabCaps,
   validateNewznabSearch,

@@ -1,6 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { BackgroundTriageSession } = require('../src/services/backgroundTriage');
+const backgroundTriage = require('../src/services/backgroundTriage');
+const { BackgroundTriageSession } = backgroundTriage;
 
 const candidates = Array.from({ length: 6 }, (_, index) => ({
   title: `Show ${index + 1}`,
@@ -23,4 +24,16 @@ test('background triage batches never exceed the remaining health-check budget',
   assert.equal(session._claimAttemptBudget(failedBatch).length, 0);
 
   session.close();
+});
+
+test('getOrStart atomically reuses an existing background session', async () => {
+  const key = 'series:single-flight';
+  const first = backgroundTriage.getOrStart(key, [], {}, {});
+  const second = backgroundTriage.getOrStart(key, candidates, {}, {});
+
+  assert.equal(first.created, true);
+  assert.equal(second.created, false);
+  assert.equal(second.session, first.session);
+  await first.session.runPromise;
+  backgroundTriage.closeSession(key);
 });

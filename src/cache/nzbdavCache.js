@@ -3,6 +3,7 @@
 // Kept in RAM but bounded by both a TTL (default 30 days for successes) and an
 // LRU entry-count cap so it can't grow without limit.
 const nzbdavStreamCache = new Map();
+let cacheGeneration = 0;
 
 // Mount descriptors point at NZBDav mounts that rotate out over time, so this
 // stays at 72h (original) — an old pointer is likely dead; better to re-resolve
@@ -63,6 +64,7 @@ function clearNzbdavStreamCache(reason = 'manual') {
   if (nzbdavStreamCache.size > 0) {
     console.log('[CACHE] Cleared NZBDav stream cache', { reason, entries: nzbdavStreamCache.size });
   }
+  cacheGeneration += 1;
   nzbdavStreamCache.clear();
 }
 
@@ -97,22 +99,37 @@ async function getOrCreateNzbdavStream(cacheKey, builder) {
     }
   }
 
+  const generation = cacheGeneration;
+  const pendingEntry = {
+    status: 'pending',
+    promise: null,
+    lastAccessedAt: Date.now(),
+    generation,
+  };
   const promise = (async () => {
     const data = await builder();
-    nzbdavStreamCache.set(cacheKey, {
-      status: 'ready',
-      data,
-      lastAccessedAt: Date.now(),
-      expiresAt: NZBDAV_CACHE_TTL_MS > 0 ? Date.now() + NZBDAV_CACHE_TTL_MS : null
-    });
+    // A clear, LRU eviction, or direct replacement revokes this builder's
+    // ownership. Its caller still receives the result, but stale work must not
+    // repopulate the shared cache.
+    if (cacheGeneration === generation && nzbdavStreamCache.get(cacheKey) === pendingEntry) {
+      nzbdavStreamCache.set(cacheKey, {
+        status: 'ready',
+        data,
+        lastAccessedAt: Date.now(),
+        expiresAt: NZBDAV_CACHE_TTL_MS > 0 ? Date.now() + NZBDAV_CACHE_TTL_MS : null
+      });
+    }
     return data;
   })();
-
-  nzbdavStreamCache.set(cacheKey, { status: 'pending', promise, lastAccessedAt: Date.now() });
+  pendingEntry.promise = promise;
+  nzbdavStreamCache.set(cacheKey, pendingEntry);
 
   try {
     return await promise;
   } catch (error) {
+    if (cacheGeneration !== generation || nzbdavStreamCache.get(cacheKey) !== pendingEntry) {
+      throw error;
+    }
     if (error?.isNzbdavFailure) {
       nzbdavStreamCache.set(cacheKey, {
         status: 'failed',
@@ -165,6 +182,7 @@ function cacheNzbdavStreamResult(cacheKey, data) {
     lastAccessedAt: Date.now(),
     expiresAt: NZBDAV_CACHE_TTL_MS > 0 ? Date.now() + NZBDAV_CACHE_TTL_MS : null,
   });
+  cleanupNzbdavCache();
 }
 
 module.exports = {

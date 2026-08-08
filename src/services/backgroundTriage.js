@@ -53,19 +53,39 @@ const backgroundSessions = new Map();
  * @param {function} [nzbdavOptions.onDecision] - Called for each triage decision: (downloadUrl, decision) => void
  * @returns {BackgroundTriageSession}
  */
+function createSession(contentKey, candidates, triageOptions, nzbdavOptions = {}) {
+  const session = new BackgroundTriageSession(contentKey, candidates, triageOptions, nzbdavOptions);
+  backgroundSessions.set(contentKey, session);
+  session.runPromise = session.run(); // fire and forget, but promise available for callers
+  return session;
+}
+
 function start(contentKey, candidates, triageOptions, nzbdavOptions = {}) {
   // Close existing session for this key
   const existing = backgroundSessions.get(contentKey);
   if (existing) {
     existing.close();
   }
-
-  const session = new BackgroundTriageSession(contentKey, candidates, triageOptions, nzbdavOptions);
-  backgroundSessions.set(contentKey, session);
-  session.runPromise = session.run(); // fire and forget, but promise available for callers
+  const session = createSession(contentKey, candidates, triageOptions, nzbdavOptions);
   // TTL + cap are enforced by the server's periodic janitor (pruneSessions), not
   // on the hot start path — and never against a session that is in use.
   return session;
+}
+
+// Atomically reuse or create a session. JavaScript executes this synchronous
+// reservation without interleaving, so two setImmediate callbacks for the same
+// cold stream request cannot both replace/start background work.
+function getOrStart(contentKey, candidates, triageOptions, nzbdavOptions = {}) {
+  const existing = getSession(contentKey);
+  if (existing) return { session: existing, created: false };
+  return {
+    session: createSession(contentKey, candidates, triageOptions, nzbdavOptions),
+    created: true,
+  };
+}
+
+function isCurrentSession(contentKey, session) {
+  return Boolean(session) && backgroundSessions.get(contentKey) === session && !session.closed;
 }
 
 function getSession(contentKey) {
@@ -745,6 +765,8 @@ function closeAllSessions(reason = 'manual') {
 
 module.exports = {
   start,
+  getOrStart,
+  isCurrentSession,
   getSession,
   closeSession,
   closeAllSessions,
