@@ -754,6 +754,18 @@ health'></textarea>
             <label>NZBDav API Key
               <input name="NZBDAV_API_KEY" type="password" autocomplete="new-password" />
             </label>
+            <label>Backend Type
+              <select name="NZBDAV_BACKEND">
+                <option value="auto">Auto (InfiniDysk preferred)</option>
+                <option value="infinidysk">InfiniDysk only</option>
+                <option value="generic">Generic NZBDav / WebDAV</option>
+              </select>
+              <span class="field-hint">Auto uses InfiniDysk's native directory API when available and falls back to WebDAV.</span>
+            </label>
+            <label>InfiniDysk Frontend/Backend Key
+              <input name="INFINIDYSK_FRONTEND_API_KEY" type="password" autocomplete="new-password" />
+              <span class="field-hint">Optional: copy InfiniDysk's FRONTEND_BACKEND_API_KEY to enable its optimized /view streaming path.</span>
+            </label>
             <label>WebDAV URL
               <input name="NZBDAV_WEBDAV_URL" type="url" placeholder="http://your-lan-ip:3000 or http://nzbdav:3000" />
             </label>

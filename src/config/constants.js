@@ -1,5 +1,9 @@
 // Constants and configuration values
 const DEFAULT_MAX_RESULT_SIZE_GB = 30;
+// NZBDAV listing backend. `auto` prefers a native InfiniDysk JSON API and
+// falls back to generic WebDAV; `generic` disables the native API entirely.
+const NZBDAV_BACKEND_VALUES = Object.freeze(['auto', 'generic', 'infinidysk']);
+const DEFAULT_NZBDAV_BACKEND = 'auto';
 
 const ADMIN_CONFIG_KEYS = [
   'ADDON_BASE_URL',
@@ -10,7 +14,9 @@ const ADMIN_CONFIG_KEYS = [
   'INDEXER_MANAGER_INDEXERS',
   'INDEXER_MANAGER_STRICT_ID_MATCH',
   'NZBDAV_URL',
+  'NZBDAV_BACKEND',
   'NZBDAV_API_KEY',
+  'INFINIDYSK_FRONTEND_API_KEY',
   'NZBDAV_WEBDAV_URL',
   'NZBDAV_WEBDAV_USER',
   'NZBDAV_WEBDAV_PASS',
@@ -66,6 +72,8 @@ const VIDEO_EXTENSIONS = new Set([
 
 module.exports = {
   DEFAULT_MAX_RESULT_SIZE_GB,
+  NZBDAV_BACKEND_VALUES,
+  DEFAULT_NZBDAV_BACKEND,
   ADMIN_CONFIG_KEYS,
   VIDEO_EXTENSIONS,
 };

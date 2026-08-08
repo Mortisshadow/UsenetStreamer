@@ -5,6 +5,7 @@ const path = require('path');
 const fs = require('fs');
 const http = require('http');
 const https = require('https');
+const crypto = require('crypto');
 const { buildContentDisposition } = require('../utils/contentDisposition');
 const { promisify } = require('util');
 const { pipeline } = require('stream');
@@ -57,6 +58,11 @@ let NZBDAV_HISTORY_SNAPSHOT_TTL_MS = (() => {
   const raw = Number(process.env.NZBDAV_HISTORY_SNAPSHOT_TTL_MS);
   return Number.isFinite(raw) && raw >= 0 ? raw : 2000;
 })();
+let NZBDAV_BACKEND = (() => {
+  const value = (process.env.NZBDAV_BACKEND || 'auto').trim().toLowerCase();
+  return ['auto', 'generic', 'infinidysk'].includes(value) ? value : 'auto';
+})();
+let INFINIDYSK_FRONTEND_API_KEY = (process.env.INFINIDYSK_FRONTEND_API_KEY || '').trim();
 
 // WebDAV client cache (must be declared before reloadConfig)
 let webdavClientPromise = null;
@@ -70,6 +76,10 @@ const FILE_SIZE_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 const FILE_SIZE_CACHE_SWEEP_INTERVAL_MS = 60 * 1000;
 const fileSizeCache = new Map();
 const historySnapshotCache = new Map();
+let infinidyskCapabilityDisabledUntil = 0;
+const INFINIDYSK_CAPABILITY_TTL_MS = 5 * 60 * 1000;
+const INFINIDYSK_LIST_TIMEOUT_MS = 10000;
+const INFINIDYSK_LIST_MAX_BYTES = 2 * 1024 * 1024;
 let lastFileSizeCacheSweepAt = 0;
 let FILE_SIZE_CACHE_MAX_ENTRIES = (() => {
   const raw = Number(process.env.NZBDAV_FILE_SIZE_CACHE_MAX_ENTRIES);
@@ -160,6 +170,11 @@ function reloadConfig() {
     const raw = Number(process.env.NZBDAV_HISTORY_SNAPSHOT_TTL_MS);
     return Number.isFinite(raw) && raw >= 0 ? raw : 2000;
   })();
+  NZBDAV_BACKEND = (() => {
+    const value = (process.env.NZBDAV_BACKEND || 'auto').trim().toLowerCase();
+    return ['auto', 'generic', 'infinidysk'].includes(value) ? value : 'auto';
+  })();
+  INFINIDYSK_FRONTEND_API_KEY = (process.env.INFINIDYSK_FRONTEND_API_KEY || '').trim();
   FILE_SIZE_CACHE_MAX_ENTRIES = (() => {
     const raw = Number(process.env.NZBDAV_FILE_SIZE_CACHE_MAX_ENTRIES);
     return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 5000;
@@ -171,6 +186,7 @@ function reloadConfig() {
   fileSizeCache.clear();
   lastFileSizeCacheSweepAt = 0;
   historySnapshotCache.clear();
+  infinidyskCapabilityDisabledUntil = 0;
   // Invalidate cached WebDAV client so next request uses fresh credentials
   resetWebdavClient();
 }
@@ -670,10 +686,29 @@ async function getWebdavClient() {
   return webdavClientPromise;
 }
 
-async function listWebdavDirectory(directory) {
-  const client = await getWebdavClient();
+async function listWebdavDirectory(directory, adapters = {}) {
   const normalizedPath = normalizeNzbdavPath(directory);
   const relativePath = normalizedPath === '/' ? '/' : normalizedPath.replace(/^\/+/, '');
+
+  const shouldTryNative = NZBDAV_BACKEND === 'infinidysk'
+    || (NZBDAV_BACKEND === 'auto' && Date.now() >= infinidyskCapabilityDisabledUntil);
+  if (shouldTryNative) {
+    try {
+      const nativeEntries = await (adapters.nativeLister || listInfiniDyskDirectory)(normalizedPath);
+      if (nativeEntries) return nativeEntries;
+    } catch (error) {
+      if (NZBDAV_BACKEND === 'infinidysk') {
+        throw new Error(`[NZBDAV] InfiniDysk directory listing failed: ${error.message}`);
+      }
+      console.warn(`[NZBDAV] InfiniDysk directory listing unavailable, falling back to WebDAV: ${error.message}`);
+      if (/capability|incompatible|401|403|408|timeout|5\d\d/i.test(error.message)) {
+        infinidyskCapabilityDisabledUntil = Date.now() + INFINIDYSK_CAPABILITY_TTL_MS;
+      }
+    }
+  }
+
+  if (adapters.webdavLister) return adapters.webdavLister(normalizedPath, relativePath);
+  const client = await getWebdavClient();
 
   try {
     const entries = await client.getDirectoryContents(relativePath, { deep: false });
@@ -688,7 +723,41 @@ async function listWebdavDirectory(directory) {
   }
 }
 
-async function findBestVideoFile({ category, jobName, requestedEpisode }) {
+async function listInfiniDyskDirectory(normalizedPath) {
+  const base = (NZBDAV_URL || NZBDAV_WEBDAV_URL).replace(/\/+$/, '');
+  if (!base) throw new Error('capability: NZBDAV_URL is not configured');
+  const response = await axios.post(`${base}/api/list-webdav-directory`,
+    new URLSearchParams({ directory: normalizedPath }).toString(), {
+    headers: {
+      ...(NZBDAV_API_KEY ? { 'x-api-key': NZBDAV_API_KEY } : {}),
+      'content-type': 'application/x-www-form-urlencoded',
+    },
+    timeout: INFINIDYSK_LIST_TIMEOUT_MS,
+    maxContentLength: INFINIDYSK_LIST_MAX_BYTES,
+    maxBodyLength: INFINIDYSK_LIST_MAX_BYTES,
+    httpAgent: nzbdavHttpAgent,
+    httpsAgent: nzbdavHttpsAgent,
+    validateStatus: () => true,
+  });
+  if ([404, 405].includes(response.status)) throw new Error(`capability: endpoint returned ${response.status}`);
+  if (response.status >= 400) throw new Error(`upstream returned ${response.status}`);
+  const payload = response.data;
+  const rawItems = Array.isArray(payload)
+    ? payload
+    : (payload?.items || payload?.Items || payload?.entries || payload?.Entries || payload?.data || payload?.Data);
+  if (!Array.isArray(rawItems)) throw new Error('capability: incompatible directory response');
+  return rawItems.map((entry) => ({
+    name: entry?.name ?? entry?.Name ?? entry?.basename ?? entry?.Filename ?? '',
+    isDirectory: (() => {
+      const value = entry?.isDirectory ?? entry?.IsDirectory ?? entry?.is_dir ?? entry?.IsDir;
+      return value === true || value === 1 || (typeof value === 'string' && value.toLowerCase() === 'true');
+    })(),
+    size: entry?.size ?? entry?.Size ?? null,
+    href: entry?.href ?? entry?.Href ?? entry?.filename ?? entry?.Filename ?? null,
+  }));
+}
+
+async function findBestVideoFile({ category, jobName, requestedEpisode, listDirectory = listWebdavDirectory }) {
   const rootPath = joinNzbdavPath('content', category, jobName);
   const queue = [{ path: rootPath, depth: 0 }];
   const visited = new Set();
@@ -707,7 +776,7 @@ async function findBestVideoFile({ category, jobName, requestedEpisode }) {
 
     let entries;
     try {
-      entries = await listWebdavDirectory(currentPath);
+      entries = await listDirectory(currentPath);
     } catch (error) {
       console.error(`[NZBDAV] Failed to list ${currentPath}:`, error.message);
       continue;
@@ -1020,6 +1089,35 @@ async function streamVideoTypeFailure(req, res, failureError) {
   return streamFileResponse(req, res, VIDEO_TYPE_FAILURE_PATH, emulateHead, 'NO VIDEO STREAM', stats);
 }
 
+function buildNzbdavUpstreamTarget(viewPath) {
+  const normalizedPath = normalizeNzbdavPath(viewPath);
+  const encodedPath = normalizedPath
+    .split('/')
+    .map((segment) => encodeURIComponent(segment))
+    .join('/');
+  const useInfiniView = NZBDAV_BACKEND !== 'generic'
+    && Boolean(INFINIDYSK_FRONTEND_API_KEY)
+    && Boolean(NZBDAV_URL);
+
+  if (!useInfiniView) {
+    return {
+      normalizedPath,
+      targetUrl: `${NZBDAV_WEBDAV_URL.replace(/\/+$/, '')}${encodedPath}`,
+      useInfiniView: false,
+    };
+  }
+
+  const exactPath = normalizedPath.replace(/^\/+/, '');
+  const downloadKey = crypto.createHmac('sha256', INFINIDYSK_FRONTEND_API_KEY)
+    .update(exactPath)
+    .digest('hex');
+  return {
+    normalizedPath,
+    targetUrl: `${NZBDAV_URL.replace(/\/+$/, '')}/view/${encodedPath.replace(/^\/+/, '')}?downloadKey=${downloadKey}`,
+    useInfiniView: true,
+  };
+}
+
 async function proxyNzbdavStream(req, res, viewPath, fileNameHint = '', fileSizeHint = null) {
   // Stremio sends many rapid range requests per stream — raise listener limit
   // to avoid false MaxListenersExceededWarning on res during concurrent proxying
@@ -1037,16 +1135,11 @@ async function proxyNzbdavStream(req, res, viewPath, fileNameHint = '', fileSize
   const isHead = originalMethod === 'HEAD';
   const proxiedMethod = originalMethod;
 
-  const normalizedPath = normalizeNzbdavPath(viewPath);
-  const encodedPath = normalizedPath
-    .split('/')
-    .map((segment) => encodeURIComponent(segment))
-    .join('/');
-  const webdavBase = NZBDAV_WEBDAV_URL.replace(/\/+$/, '');
-  const targetUrl = `${webdavBase}${encodedPath}`;
+  const { normalizedPath, targetUrl, useInfiniView } = buildNzbdavUpstreamTarget(viewPath);
+  const encodedPath = normalizedPath.split('/').map((segment) => encodeURIComponent(segment)).join('/');
   const headers = {};
 
-  console.log(`[NZBDAV] Streaming ${normalizedPath} via WebDAV`);
+  console.log(`[NZBDAV] Streaming ${normalizedPath} via ${useInfiniView ? 'InfiniDysk /view' : 'WebDAV'}`);
 
   const coerceToString = (value) => {
     if (Array.isArray(value)) {
@@ -1102,7 +1195,7 @@ async function proxyNzbdavStream(req, res, viewPath, fileNameHint = '', fileSize
       httpsAgent: nzbdavHttpsAgent
     };
 
-    if (NZBDAV_WEBDAV_USER && NZBDAV_WEBDAV_PASS) {
+    if (!useInfiniView && NZBDAV_WEBDAV_USER && NZBDAV_WEBDAV_PASS) {
       headConfig.auth = {
         username: NZBDAV_WEBDAV_USER,
         password: NZBDAV_WEBDAV_PASS
@@ -1153,14 +1246,14 @@ async function proxyNzbdavStream(req, res, viewPath, fileNameHint = '', fileSize
     httpsAgent: nzbdavHttpsAgent
   };
 
-  if (NZBDAV_WEBDAV_USER && NZBDAV_WEBDAV_PASS) {
+  if (!useInfiniView && NZBDAV_WEBDAV_USER && NZBDAV_WEBDAV_PASS) {
     requestConfig.auth = {
       username: NZBDAV_WEBDAV_USER,
       password: NZBDAV_WEBDAV_PASS
     };
   }
 
-  console.log(`[NZBDAV] Proxying ${proxiedMethod} ${targetUrl}`);
+  console.log(`[NZBDAV] Proxying ${proxiedMethod} ${useInfiniView ? `${NZBDAV_URL}/view/${encodedPath.replace(/^\/+/, '')}` : targetUrl}`);
 
   const nzbdavResponse = await axios.request(requestConfig);
 
@@ -1291,5 +1384,6 @@ module.exports = {
   getCachedFileSize,
   setCachedFileSize,
   getNzbdavLocalCacheStats,
+  buildNzbdavUpstreamTarget,
   reloadConfig,
 };
